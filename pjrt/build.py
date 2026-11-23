@@ -33,6 +33,7 @@ def pjrt_header(directory):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--zig", default=shutil.which("zig"), help="Zig executable on the host")
+    parser.add_argument("--debug", action="store_true", help="Build with LLDB symbols")
     parser.add_argument("--ndk", type=Path,
                         default=ROOT.parent / ".gpu-android-tools" / "android-ndk-r30")
     args = parser.parse_args()
@@ -43,7 +44,7 @@ def main():
         parser.error(f"Android NDK toolchain not found: {toolchain}")
 
     header = pjrt_header(ROOT / "build/pjrt-deps")
-    output = ROOT / "build/pjrt"
+    output = ROOT / ("build/pjrt-debug" if args.debug else "build/pjrt")
     package = output / "jax_plugins/mali"
     package.mkdir(parents=True, exist_ok=True)
     zig_env = {
@@ -51,19 +52,21 @@ def main():
         "ZIG_GLOBAL_CACHE_DIR": str(ROOT / "build/pjrt-deps/zig-global-cache"),
         "ZIG_LOCAL_CACHE_DIR": str(ROOT / "build/pjrt-deps/zig-local-cache"),
     }
+    compiler_flags = ["-O0", "-g"] if args.debug else ["-O2"]
     subprocess.run([
         args.zig, "cc", "-target", "aarch64-linux-gnu.2.28", "-shared", "-fPIC",
-        "-std=c11", "-O2", "-fvisibility=hidden", "-Wall", "-Wextra", "-Werror",
+        "-std=c11", *compiler_flags, "-fvisibility=hidden", "-Wall", "-Wextra", "-Werror",
         "-I", str(header.parent), str(SOURCE / "plugin.c"),
         "-o", str(package / "libpjrt_mali.so"),
     ], check=True, cwd=ROOT, env=zig_env)
 
-    android_build = ROOT / "build/pjrt-android"
+    android_build = ROOT / ("build/pjrt-android-debug" if args.debug else "build/pjrt-android")
+    build_type = "Debug" if args.debug else "Release"
     subprocess.run([
         "cmake", "-S", str(ROOT), "-B", str(android_build), "-G", "Ninja",
         f"-DCMAKE_TOOLCHAIN_FILE={toolchain.as_posix()}",
         "-DANDROID_ABI=arm64-v8a", "-DANDROID_PLATFORM=android-24",
-        "-DCMAKE_BUILD_TYPE=Release",
+        f"-DCMAKE_BUILD_TYPE={build_type}",
     ], check=True)
     subprocess.run(["cmake", "--build", str(android_build), "--target", "mali_worker"],
                    check=True)
