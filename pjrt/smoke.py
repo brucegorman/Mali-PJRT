@@ -1,4 +1,4 @@
-"""Verify Mali device enumeration on Android."""
+"""Verify Mali device enumeration and PJRT buffer round trips on Android."""
 
 import argparse
 import os
@@ -37,14 +37,27 @@ def check_device(missing_worker):
           f"compute_queue_family={device.queue_family} {device.client.platform_version}",
           flush=True)
 
-    try:
-        jax.device_put(np.ones(2, dtype=np.float32), device)
-    except RuntimeError as error:
-        if "Mali PJRT buffer upload is unavailable" not in str(error):
-            raise
-        print("PASS: unavailable buffer upload returned a PJRT error", flush=True)
-    else:
-        raise RuntimeError("Buffer upload unexpectedly succeeded")
+    cases = (
+        np.arange(257 * 257, dtype=np.float32).reshape(257, 257),
+        np.arange(35, dtype=np.int32).reshape(5, 7)[::-1, ::2].T,
+        np.array(3.5, dtype=np.float32),
+        np.empty((0, 3), dtype=np.float16),
+        np.array([True, False, True]),
+    )
+    for host in cases:
+        expected = host.copy()
+        array = jax.device_put(host, device)
+        array.block_until_ready()
+        if array.device != device or array.on_device_size_in_bytes() != host.nbytes:
+            raise RuntimeError("Unexpected Mali buffer device or byte length")
+        host[...] = 0
+        array.copy_to_host_async()
+        np.testing.assert_array_equal(np.asarray(array), expected, strict=True)
+        array.delete()
+        array.delete()
+        if not array.is_deleted():
+            raise RuntimeError("Mali buffer was not marked deleted")
+    print("PASS: Mali upload, readback, and deletion for five input layouts", flush=True)
 
     try:
         jax.jit(lambda x: x + x).lower(jax.ShapeDtypeStruct((2,), np.float32)).compile()

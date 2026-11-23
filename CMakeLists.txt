@@ -10,7 +10,7 @@ target_compile_features(vulkan_probe PRIVATE c_std_11)
 target_compile_options(vulkan_probe PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(vulkan_probe PRIVATE vulkan)
 
-add_executable(mali_worker pjrt/worker.c)
+add_executable(mali_worker pjrt/worker.c pjrt/worker_buffers.c)
 target_compile_features(mali_worker PRIVATE c_std_11)
 target_compile_options(mali_worker PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(mali_worker PRIVATE vulkan)

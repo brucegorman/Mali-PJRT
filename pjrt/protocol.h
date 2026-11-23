@@ -5,12 +5,15 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <errno.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/uio.h>
 
-#define MALI_PJRT_HELLO "MALI-PJRT/2 HELLO"
-#define MALI_PJRT_PROTOCOL_VERSION 2
+#define MALI_PJRT_HELLO "MALI-PJRT/3 HELLO"
+#define MALI_PJRT_PROTOCOL_VERSION 3
 #define MALI_VULKAN_VENDOR_ID 0x13b5u
+#define MALI_TRANSFER_CHUNK (64 * 1024u)
 
 // Both peers use little-endian arm64. This packet contains no process-local pointers.
 struct mali_device_info {
@@ -23,6 +26,60 @@ struct mali_device_info {
 };
 
 _Static_assert(sizeof(struct mali_device_info) == 276, "Unexpected device packet layout");
+
+enum mali_operation {
+    MALI_ALLOCATE = 1,
+    MALI_WRITE,
+    MALI_READ,
+    MALI_RELEASE,
+};
+
+enum mali_status {
+    MALI_OK = 0,
+    MALI_INVALID,
+    MALI_NOT_FOUND,
+    MALI_OUT_OF_MEMORY,
+    MALI_UNSUPPORTED_MEMORY,
+};
+
+struct mali_request {
+    uint64_t handle;
+    uint64_t offset;
+    uint64_t length;
+    uint32_t operation;
+    uint32_t reserved;
+};
+
+struct mali_reply {
+    uint64_t handle;
+    uint32_t status;
+    uint32_t reserved;
+};
+
+_Static_assert(sizeof(struct mali_request) == 32 && sizeof(struct mali_reply) == 16,
+               "Unexpected buffer packet layout");
+
+static inline bool send_packet(int socket, const void *header, size_t header_size,
+                               const void *data, size_t data_size) {
+    struct iovec iov[] = {{(void *)header, header_size}, {(void *)data, data_size}};
+    struct msghdr message = {.msg_iov = iov, .msg_iovlen = data_size ? 2 : 1};
+    ssize_t count;
+    do {
+        count = sendmsg(socket, &message, MSG_NOSIGNAL);
+    } while (count < 0 && errno == EINTR);
+    return count == (ssize_t)(header_size + data_size);
+}
+
+static inline ssize_t receive_packet(int socket, void *header, size_t header_size,
+                                     void *data, size_t data_size) {
+    struct iovec iov[] = {{header, header_size}, {data, data_size}};
+    struct msghdr message = {.msg_iov = iov, .msg_iovlen = data_size ? 2 : 1};
+    ssize_t count;
+    do {
+        count = recvmsg(socket, &message, MSG_TRUNC);
+    } while (count < 0 && errno == EINTR);
+    return count;
+}
 
 static inline bool worker_address(const char *name, struct sockaddr_un *address,
                                   socklen_t *address_length) {

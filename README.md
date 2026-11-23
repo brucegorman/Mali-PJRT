@@ -95,7 +95,8 @@ python verify_android.py --runner build/iree-3.11-android/tools/iree-run-module 
 The [PJRT backend](pjrt/README.md) connects the JAX plugin loader to an
 Android worker. It reuses the phone's glibc JAX environment and uses a Unix
 socket to reach the Android process. On the Y36m, `jax.devices("mali")` returns
-the Mali-G57 MC2 opened by the worker.
+the Mali-G57 MC2 opened by the worker. `jax.device_put()` and NumPy readback
+transfer arrays through Vulkan buffers owned by that worker.
 
 The JIT milestone is to run the `train_eight_steps` fixture through the
 `mali` backend. IREE's experimental

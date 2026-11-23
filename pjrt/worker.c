@@ -5,11 +5,13 @@
 #include <vulkan/vulkan.h>
 
 #include "protocol.h"
+#include "worker_buffers.h"
 
 struct mali_vulkan {
     VkInstance instance;
     VkDevice device;
     VkQueue queue;
+    VkPhysicalDeviceMemoryProperties memory;
     struct mali_device_info info;
 };
 
@@ -94,6 +96,7 @@ static bool open_vulkan(struct mali_vulkan *vulkan) {
             continue;
         }
         vkGetDeviceQueue(vulkan->device, family, 0, &vulkan->queue);
+        vkGetPhysicalDeviceMemoryProperties(devices[index], &vulkan->memory);
         vulkan->info = (struct mali_device_info){
             .protocol_version = MALI_PJRT_PROTOCOL_VERSION,
             .vendor_id = properties.vendorID,
@@ -119,7 +122,7 @@ static void close_vulkan(struct mali_vulkan *vulkan) {
     }
 }
 
-static int serve_client(int listener, const struct mali_device_info *device) {
+static int serve_client(int listener, const struct mali_vulkan *vulkan) {
     int client = accept(listener, NULL, NULL);
     if (client < 0) {
         perror("accept");
@@ -131,16 +134,8 @@ static int serve_client(int listener, const struct mali_device_info *device) {
     int result = 1;
     if (length == sizeof(MALI_PJRT_HELLO) - 1 &&
         memcmp(request, MALI_PJRT_HELLO, (size_t)length) == 0) {
-        if (send(client, device, sizeof(*device), MSG_NOSIGNAL) == sizeof(*device)) {
-            // Hold the Vulkan device for the lifetime of the PJRT connection.
-            length = recv(client, request, sizeof(request), MSG_TRUNC);
-            if (length == 0) {
-                result = 0;
-            } else if (length < 0) {
-                perror("recv");
-            } else {
-                fputs("Unsupported PJRT worker request\n", stderr);
-            }
+        if (send_packet(client, &vulkan->info, sizeof(vulkan->info), NULL, 0)) {
+            result = serve_buffers(client, vulkan->device, &vulkan->memory);
         } else {
             perror("send");
         }
@@ -178,7 +173,7 @@ int main(int argc, char **argv) {
         if (open_vulkan(&vulkan)) {
             puts("READY");
             fflush(stdout);
-            result = serve_client(listener, &vulkan.info);
+            result = serve_client(listener, &vulkan);
         }
         close_vulkan(&vulkan);
     }

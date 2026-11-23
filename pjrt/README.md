@@ -3,17 +3,23 @@
 JAX 0.6.1 loads a Linux arm64 PJRT library and connects to an Android arm64
 worker over an abstract Unix socket. The worker opens a Vulkan logical device
 and compute queue. JAX exposes that device through `jax.devices("mali")`.
+Use `jax.device_put(x, mali)` to upload and `np.asarray(x_on_mali)` to read back.
 
 | File | Entry point |
 |---|---|
 | [Python registration](jax_plugins/mali/__init__.py) | JAX discovers the package and loads `libpjrt_mali.so`. |
 | [PJRT C plugin](plugin.c) | `GetPjrtApi()` exposes the API table. `client_create()` reads and owns the device description. |
 | [Android worker](worker.c) | `open_vulkan()` opens an Arm Vulkan 1.1 device. `serve_client()` holds it until the PJRT client disconnects. |
-| [Protocol](protocol.h) | The versioned hello, device metadata packet, and abstract socket address helper. |
+| [PJRT buffer callbacks](buffer.c) | Transfers bytes in chunks and keeps the worker handle, shape, and dtype. |
+| [Worker buffers](worker_buffers.c) | Allocates, maps, and releases Vulkan buffers. A connection owns its buffers. |
+| [Protocol](protocol.h) | The versioned hello, device metadata packet, and buffer requests. |
 
-The Y36m reports a single `Mali-G57 MC2` with Vulkan 1.1.177. The default PJRT
-device memory is described to JAX. Buffer transfer, JIT compilation, and GPU
-execution are the remaining backend operations.
+The Y36m reports a single `Mali-G57 MC2` with Vulkan 1.1.177. Transfers are
+synchronous and use host-visible coherent Vulkan memory. The worker prefers
+device-local memory with both properties. The backend supports dense row-major
+device buffers, strided host uploads, and conventional byte-aligned types
+such as float32, int32 and bool. JIT compilation and GPU dispatch through PJRT
+are the remaining operations.
 
 ## Build and check
 
@@ -32,11 +38,16 @@ omit `--zig`. Use the device directory set up in the
 [phone training instructions](../README.md#compile-and-train-on-the-phone).
 The build fetches and verifies the PJRT header from the XLA revision used by
 JAX 0.6.1. The plugin targets glibc 2.28, and the worker targets Android API 24.
+If LLDB has the existing worker open on Windows, use `--debug --output
+build/pjrt-buffers-debug` and use `pjrt-buffers-debug` as the package directory
+in the debug commands below.
 
-The smoke check verifies one local Mali device with real Vulkan metadata,
-the default memory description, and clean worker shutdown after the JAX
-process exits. It checks the PJRT errors for operations still in development
-and for a missing worker.
+The smoke check verifies device metadata, upload, readback and deletion for
+a multi-packet float32 matrix, a strided int32 view, a scalar, an empty array,
+and bool values. It mutates the host input after upload to verify independent
+storage. It also checks that JIT returns a PJRT error and that the worker shuts
+down after the JAX process exits. The missing-worker check exercises backend
+initialization failure.
 
 ## Android 调试入门
 
@@ -138,4 +149,4 @@ gdb-remote 127.0.0.1:49184
 
 如果 LLDB 先停在启动信号，输入 `continue`；如果已经显示 `stop reason = breakpoint`，直接看现场。在 [`client_create()`](plugin.c) 断住时，用 `thread backtrace` 看调用栈，用 `frame variable args` 看 PJRT 参数。继续执行后，Python 应该打印 `[Mali-G57 MC2]`。
 
-想跟踪数组上传，就把断点改成 `client_buffer_from_host`，把 Python 的触发动作改为 `jax.device_put()`。当前上传回调会返回 `UNIMPLEMENTED`。结束插件调试后，在 PowerShell 运行 `adb forward --remove tcp:49184`。
+想跟踪数组上传，就在 [buffer.c](buffer.c) 的 `client_buffer_from_host` 下断点，用 `jax.device_put()` 触发。跟踪读回时，在 `buffer_to_host` 下断点，调用 `np.asarray()`。结束插件调试后，在 PowerShell 运行 `adb forward --remove tcp:49184`。

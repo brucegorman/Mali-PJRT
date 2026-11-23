@@ -4,31 +4,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-#include "pjrt_c_api.h"
-#include "protocol.h"
-
-struct PJRT_DeviceDescription {
-    struct mali_device_info info;
-    PJRT_NamedValue attributes[3];
-};
-
-struct PJRT_Device {
-    PJRT_Client *client;
-    PJRT_DeviceDescription description;
-};
-
-struct PJRT_Memory {
-    PJRT_Client *client;
-};
-
-struct PJRT_Client {
-    int worker;
-    char platform_version[64];
-    PJRT_Device device;
-    PJRT_Device *devices[1];
-    PJRT_Memory memory;
-    PJRT_Memory *memories[1];
-};
+#include "plugin_internal.h"
 
 struct PJRT_Error {
     PJRT_Error_Code code;
@@ -39,7 +15,7 @@ static PJRT_Error no_memory = {
     PJRT_Error_Code_RESOURCE_EXHAUSTED, "Could not allocate a PJRT error",
 };
 
-static PJRT_Error *make_error(PJRT_Error_Code code, const char *message) {
+PJRT_Error *make_error(PJRT_Error_Code code, const char *message) {
     PJRT_Error *error = malloc(sizeof(*error));
     if (error == NULL) {
         return &no_memory;
@@ -115,6 +91,11 @@ static PJRT_Error *client_create(PJRT_Client_Create_Args *args) {
         close(worker);
         return &no_memory;
     }
+    if (pthread_mutex_init(&client->worker_lock, NULL) != 0) {
+        close(worker);
+        free(client);
+        return make_error(PJRT_Error_Code_INTERNAL, "Could not initialize the worker lock");
+    }
     client->worker = worker;
     uint32_t version = info.api_version;
     snprintf(client->platform_version, sizeof(client->platform_version), "Vulkan %u.%u.%u",
@@ -142,7 +123,10 @@ static PJRT_Error *client_create(PJRT_Client_Create_Args *args) {
 }
 
 static PJRT_Error *client_destroy(PJRT_Client_Destroy_Args *args) {
-    close(args->client->worker);
+    if (args->client->worker >= 0) {
+        close(args->client->worker);
+    }
+    pthread_mutex_destroy(&args->client->worker_lock);
     free(args->client);
     return NULL;
 }
@@ -315,15 +299,7 @@ static PJRT_Error *client_compile(PJRT_Client_Compile_Args *args) {
     return make_error(PJRT_Error_Code_UNIMPLEMENTED, "Mali PJRT compilation is unavailable");
 }
 
-static PJRT_Error *client_buffer_from_host(PJRT_Client_BufferFromHostBuffer_Args *args) {
-    args->buffer = NULL;
-    args->done_with_host_buffer = NULL;
-    return make_error(PJRT_Error_Code_UNIMPLEMENTED, "Mali PJRT buffer upload is unavailable");
-}
-
-__attribute__((visibility("default")))
-const PJRT_Api *GetPjrtApi(void) {
-    static const PJRT_Api api = {
+static PJRT_Api api = {
         .struct_size = PJRT_Api_STRUCT_SIZE,
         .pjrt_api_version = {
             .struct_size = PJRT_Api_Version_STRUCT_SIZE,
@@ -366,7 +342,15 @@ const PJRT_Api *GetPjrtApi(void) {
         .PJRT_Memory_AddressableByDevices = memory_addressable_by_devices,
         .PJRT_Client_DefaultDeviceAssignment = client_default_device_assignment,
         .PJRT_Client_Compile = client_compile,
-        .PJRT_Client_BufferFromHostBuffer = client_buffer_from_host,
-    };
+};
+
+static void initialize_api(void) {
+    register_buffer_api(&api);
+}
+
+__attribute__((visibility("default")))
+const PJRT_Api *GetPjrtApi(void) {
+    static pthread_once_t initialized = PTHREAD_ONCE_INIT;
+    pthread_once(&initialized, initialize_api);
     return &api;
 }
