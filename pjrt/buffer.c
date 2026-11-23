@@ -4,47 +4,6 @@
 
 #include "plugin_internal.h"
 
-struct PJRT_Event {
-    bool deleted_buffer;
-};
-
-// Transfers are synchronous, so all events can share immutable terminal states.
-static PJRT_Event ready_event;
-static PJRT_Event deleted_event = {.deleted_buffer = true};
-
-PJRT_Event *buffer_ready(void) {
-    return &ready_event;
-}
-
-static PJRT_Error *event_status(PJRT_Event *event) {
-    return event->deleted_buffer
-        ? make_error(PJRT_Error_Code_FAILED_PRECONDITION, "Mali buffer was deleted")
-        : NULL;
-}
-
-static PJRT_Error *event_destroy(PJRT_Event_Destroy_Args *args) {
-    (void)args;
-    return NULL;
-}
-
-static PJRT_Error *event_is_ready(PJRT_Event_IsReady_Args *args) {
-    args->is_ready = true;
-    return NULL;
-}
-
-static PJRT_Error *event_error(PJRT_Event_Error_Args *args) {
-    return event_status(args->event);
-}
-
-static PJRT_Error *event_await(PJRT_Event_Await_Args *args) {
-    return event_status(args->event);
-}
-
-static PJRT_Error *event_on_ready(PJRT_Event_OnReady_Args *args) {
-    args->callback(event_status(args->event), args->user_arg);
-    return NULL;
-}
-
 enum transport_status {
     TRANSPORT_CLOSED = -4,
     TRANSPORT_SEND_FAILED,
@@ -188,6 +147,12 @@ static bool array_size(const int64_t *dims, size_t rank, size_t item_size, size_
     return true;
 }
 
+bool tensor_size(const struct mali_tensor *tensor, size_t *size) {
+    size_t item_size = element_size(tensor->type);
+    return tensor->rank <= MALI_MAX_RANK && item_size != 0 &&
+           array_size(tensor->dims, tensor->rank, item_size, size);
+}
+
 static bool check_strides(const PJRT_Client_BufferFromHostBuffer_Args *args,
                           size_t item_size, bool *dense) {
     *dense = true;
@@ -233,21 +198,15 @@ static void pack_host_array(const PJRT_Client_BufferFromHostBuffer_Args *args,
     }
 }
 
-void release_handle(PJRT_Client *client, uint64_t handle) {
-    struct mali_request request = {.operation = MALI_RELEASE, .handle = handle};
-    struct mali_reply reply;
-    exchange(client, &request, NULL, 0, NULL, 0, &reply);
-}
-
-static int transfer(PJRT_Buffer *buffer, enum mali_operation operation,
+static int transfer(struct mali_resource *resource, enum mali_operation operation,
                     size_t offset, size_t size, const void *input, void *output) {
     struct mali_reply reply;
     while (size > 0) {
         const size_t chunk = size < MALI_TRANSFER_CHUNK ? size : MALI_TRANSFER_CHUNK;
         struct mali_request request = {
-            .operation = operation, .handle = buffer->handle, .offset = offset, .length = chunk,
+            .operation = operation, .handle = resource->handle, .offset = offset, .length = chunk,
         };
-        int status = exchange(buffer->client, &request, input, input ? chunk : 0,
+        int status = exchange(resource->client, &request, input, input ? chunk : 0,
                               output, output ? chunk : 0, &reply);
         if (status != MALI_OK) {
             return status;
@@ -264,14 +223,18 @@ static int transfer(PJRT_Buffer *buffer, enum mali_operation operation,
     return MALI_OK;
 }
 
-PJRT_Buffer *create_buffer(PJRT_Client *client, const struct mali_tensor *tensor, uint64_t handle) {
+PJRT_Buffer *create_buffer(PJRT_Client *client, const struct mali_tensor *tensor, PJRT_Event *ready) {
     if (tensor->rank > MALI_MAX_RANK) {
         return NULL;
     }
     PJRT_Buffer *buffer = calloc(1, sizeof(*buffer) + tensor->rank * 2 * sizeof(int64_t));
     if (buffer != NULL) {
+        buffer->resource = create_resource(client, MALI_RELEASE, 0, ready);
+        if (buffer->resource == NULL) {
+            free(buffer);
+            return NULL;
+        }
         buffer->client = client;
-        buffer->handle = handle;
         buffer->size = tensor->size;
         buffer->rank = tensor->rank;
         buffer->type = tensor->type;
@@ -310,7 +273,7 @@ static PJRT_Error *client_buffer_from_host(PJRT_Client_BufferFromHostBuffer_Args
     for (size_t i = 0; i < args->num_dims; ++i) {
         tensor.dims[i] = args->dims[i];
     }
-    PJRT_Buffer *buffer = create_buffer(args->client, &tensor, 0);
+    PJRT_Buffer *buffer = create_buffer(args->client, &tensor, ready_event());
     if (buffer == NULL) {
         return make_error(PJRT_Error_Code_RESOURCE_EXHAUSTED, "Could not record Mali buffer");
     }
@@ -318,6 +281,7 @@ static PJRT_Error *client_buffer_from_host(PJRT_Client_BufferFromHostBuffer_Args
     if (!dense) {
         packed = malloc(size);
         if (packed == NULL) {
+            release_resource(buffer->resource);
             free(buffer);
             return make_error(PJRT_Error_Code_RESOURCE_EXHAUSTED, "Could not pack strided host data");
         }
@@ -330,34 +294,47 @@ static PJRT_Error *client_buffer_from_host(PJRT_Client_BufferFromHostBuffer_Args
     pthread_mutex_lock(&args->client->worker_lock);
     int status = exchange(args->client, &request, &tensor, sizeof(tensor), NULL, 0, &reply);
     if (status == MALI_OK) {
-        buffer->handle = reply.handle;
+        buffer->resource->handle = reply.handle;
         operation = MALI_WRITE;
-        status = transfer(buffer, operation, 0, size, packed != NULL ? packed : args->data, NULL);
-        if (status != MALI_OK) {
-            release_handle(args->client, buffer->handle);
-        }
+        status = transfer(buffer->resource, operation, 0, size,
+                          packed != NULL ? packed : args->data, NULL);
     }
     pthread_mutex_unlock(&args->client->worker_lock);
     free(packed);
     if (status != MALI_OK) {
+        release_resource(buffer->resource);
         free(buffer);
         return transfer_error(operation, status);
     }
     args->buffer = buffer;
-    args->done_with_host_buffer = &ready_event;
+    args->done_with_host_buffer = ready_event();
     return NULL;
 }
 
 static PJRT_Error *download(PJRT_Buffer *buffer, size_t offset, size_t size, void *output,
                             PJRT_Event **event) {
     *event = NULL;
-    pthread_mutex_lock(&buffer->client->worker_lock);
-    int status = buffer->handle != 0
-        ? transfer(buffer, MALI_READ, offset, size, NULL, output)
-        : MALI_NOT_FOUND;
-    pthread_mutex_unlock(&buffer->client->worker_lock);
+    PJRT_Client *client = buffer->client;
+    pthread_mutex_lock(&client->dispatch_lock);
+    struct mali_resource *resource = buffer->resource;
+    if (resource != NULL) {
+        retain_resource(resource);
+    }
+    pthread_mutex_unlock(&client->dispatch_lock);
+    if (resource == NULL) {
+        return transfer_error(MALI_READ, MALI_NOT_FOUND);
+    }
+    int status = await_event(resource->ready);
+    if (status != MALI_OK) {
+        release_resource(resource);
+        return transfer_error(MALI_EXECUTE, status);
+    }
+    pthread_mutex_lock(&client->worker_lock);
+    status = transfer(resource, MALI_READ, offset, size, NULL, output);
+    pthread_mutex_unlock(&client->worker_lock);
+    release_resource(resource);
     if (status == MALI_OK) {
-        *event = &ready_event;
+        *event = ready_event();
     }
     return transfer_error(MALI_READ, status);
 }
@@ -369,7 +346,7 @@ static PJRT_Error *buffer_to_host(PJRT_Buffer_ToHostBuffer_Args *args) {
     }
     if (args->dst == NULL) {
         args->dst_size = args->src->size;
-        args->event = &ready_event;
+        args->event = ready_event();
         return NULL;
     }
     if (args->dst_size < args->src->size) {
@@ -389,42 +366,30 @@ static PJRT_Error *buffer_copy_raw_to_host(PJRT_Buffer_CopyRawToHost_Args *args)
                     args->dst, &args->event);
 }
 
-static void delete_buffer(PJRT_Buffer *buffer) {
-    pthread_mutex_lock(&buffer->client->worker_lock);
-    if (buffer->handle != 0) {
-        release_handle(buffer->client, buffer->handle);
-        buffer->handle = 0;
-    }
-    pthread_mutex_unlock(&buffer->client->worker_lock);
-}
-
 static PJRT_Error *buffer_delete(PJRT_Buffer_Delete_Args *args) {
-    delete_buffer(args->buffer);
+    delete_resource(args->buffer->client, &args->buffer->resource);
     return NULL;
 }
 
 static PJRT_Error *buffer_destroy(PJRT_Buffer_Destroy_Args *args) {
     if (args->buffer != NULL) {
-        delete_buffer(args->buffer);
+        delete_resource(args->buffer->client, &args->buffer->resource);
         free(args->buffer);
     }
     return NULL;
 }
 
-static bool is_deleted(PJRT_Buffer *buffer) {
-    pthread_mutex_lock(&buffer->client->worker_lock);
-    bool deleted = buffer->handle == 0;
-    pthread_mutex_unlock(&buffer->client->worker_lock);
-    return deleted;
-}
-
 static PJRT_Error *buffer_is_deleted(PJRT_Buffer_IsDeleted_Args *args) {
-    args->is_deleted = is_deleted(args->buffer);
+    args->is_deleted = resource_deleted(args->buffer->client, &args->buffer->resource);
     return NULL;
 }
 
 static PJRT_Error *buffer_ready_event(PJRT_Buffer_ReadyEvent_Args *args) {
-    args->event = is_deleted(args->buffer) ? &deleted_event : &ready_event;
+    PJRT_Buffer *buffer = args->buffer;
+    pthread_mutex_lock(&buffer->client->dispatch_lock);
+    args->event = buffer->resource != NULL ? buffer->resource->ready : deleted_event();
+    retain_event(args->event);
+    pthread_mutex_unlock(&buffer->client->dispatch_lock);
     return NULL;
 }
 
@@ -485,11 +450,6 @@ static PJRT_Error *buffer_memory(PJRT_Buffer_Memory_Args *args) {
 }
 
 void register_buffer_api(PJRT_Api *api) {
-    api->PJRT_Event_Destroy = event_destroy;
-    api->PJRT_Event_IsReady = event_is_ready;
-    api->PJRT_Event_Error = event_error;
-    api->PJRT_Event_Await = event_await;
-    api->PJRT_Event_OnReady = event_on_ready;
     api->PJRT_Client_BufferFromHostBuffer = client_buffer_from_host;
     api->PJRT_Buffer_ToHostBuffer = buffer_to_host;
     api->PJRT_Buffer_CopyRawToHost = buffer_copy_raw_to_host;

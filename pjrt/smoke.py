@@ -7,6 +7,7 @@ import select
 import signal
 import subprocess
 import tempfile
+import time
 import uuid
 
 def check_device(missing_worker):
@@ -209,12 +210,19 @@ def check_disconnect(worker_pid, worker_stdout):
     device, = jax.devices("mali")
     x = jax.device_put(np.array([1, 2], dtype=np.float32), device)
     compiled = jax.jit(lambda value: value + value).lower(x).compile()
+    os.kill(worker_pid, signal.SIGSTOP)
+    status = Path(f"/proc/{worker_pid}/status")
+    while "State:\tT" not in status.read_text():
+        time.sleep(0.001)
+    failed = compiled(x)
+    dependent = compiled(failed)
     os.kill(worker_pid, signal.SIGKILL)
     with os.fdopen(worker_stdout, "rb") as stdout:
         if stdout.read():
             raise RuntimeError("Unexpected output after stopping the Mali worker")
 
-    for action, operation in ((lambda: compiled(x).block_until_ready(), "execute"),
+    for action, operation in ((failed.block_until_ready, "execute"),
+                              (dependent.block_until_ready, "execute"),
                               (lambda: np.asarray(x), "read")):
         try:
             action()
@@ -223,10 +231,10 @@ def check_disconnect(worker_pid, worker_stdout):
                 raise
         else:
             raise RuntimeError(f"Mali worker {operation} succeeded after disconnect")
-    print("PASS: execution and readback report operation-specific errors after worker exit", flush=True)
+    print("PASS: worker exit fails both queued results and subsequent readback", flush=True)
 
 
-def run_worker(package, command, disconnect=False):
+def run_worker(package, command, disconnect=False, async_probe=False):
     socket_name = f"mali-pjrt-{uuid.uuid4().hex}"
     environment = {**os.environ, "MALI_PJRT_SOCKET": socket_name}
     worker = subprocess.Popen([str(package / "mali_worker"), socket_name],
@@ -240,7 +248,10 @@ def run_worker(package, command, disconnect=False):
         if disconnect:
             pass_fds = (worker.stdout.fileno(),)
             command = [*command, "--disconnect-client", str(worker.pid), str(pass_fds[0])]
-        subprocess.run(command, check=True, timeout=90, env=environment, pass_fds=pass_fds)
+        if async_probe:
+            command = [*command, str(worker.pid)]
+        subprocess.run(command, check=True, timeout=30 if disconnect else 90,
+                       env=environment, pass_fds=pass_fds)
         expected_exit = -signal.SIGKILL if disconnect else 0
         if worker.wait(timeout=5) != expected_exit:
             raise RuntimeError("Mali worker did not shut down cleanly")
@@ -256,6 +267,8 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--missing-worker", action="store_true")
     mode.add_argument("--abi", action="store_true", help="Check compile options and output metadata via C")
+    mode.add_argument("--async", dest="async_probe", action="store_true",
+                      help="Check pending events and queued execution with a paused worker")
     mode.add_argument("--cache", action="store_true", help="Save and reload a JIT in separate processes")
     mode.add_argument("--disconnect", action="store_true", help="Check errors after the worker exits")
     mode.add_argument("--disconnect-client", nargs=2, type=int, help=argparse.SUPPRESS)
@@ -286,14 +299,14 @@ def main():
             path = str(Path(temporary) / "train.malivmfb")
             run_worker(package, [*client_command, "--cache-write", path])
             run_worker(package, [*client_command, "--cache-read", path])
-    elif args.abi:
+    elif args.abi or args.async_probe:
         probe = package / "abi_smoke"
         probe.chmod(0o700)
         run_worker(package, [
             os.environ["MALI_GLIBC_LOADER"], "--library-path",
             os.environ["MALI_GLIBC_LIBRARIES"], str(probe),
             str(package / "jax_plugins/mali/libpjrt_mali.so"),
-        ])
+        ], async_probe=args.async_probe)
     else:
         run_worker(package, [*client_command, "--client"])
 

@@ -15,8 +15,9 @@ handles so a caller can pass the results into another JIT call.
 | [Python registration](jax_plugins/mali/__init__.py) | JAX discovers the package and loads `libpjrt_mali.so`. |
 | [PJRT C plugin](plugin.c) | `GetPjrtApi()` exposes the API table. `client_create()` reads and owns the device description. |
 | [Android worker](worker.c) | `open_vulkan()` opens an Arm Vulkan 1.1 device. `serve_client()` holds it until the PJRT client disconnects. |
-| [PJRT buffer callbacks](buffer.c) | Transfers bytes in chunks and keeps the worker handle, shape, and dtype. |
-| [PJRT executable callbacks](executable.c) | Invokes the arm64 IREE compiler, loads an executable, and dispatches it by handle. |
+| [PJRT buffer callbacks](buffer.c) | Transfers bytes in chunks and exposes buffer metadata and readiness. |
+| [PJRT executable callbacks](executable.c) | Invokes the arm64 IREE compiler, loads an executable, and builds queued requests with pending outputs. |
+| [Asynchronous execution](async.c) | Owns the single-device FIFO, completion events, callback thread, and references to in-flight worker resources. |
 | [Executable images](executable_image.c) | Serializes VMFB with a versioned header and validates device, driver, compiler revision, and checksum on reload. |
 | [Compile options](compile_options.c) | Validates the pinned XLA options for one local device before starting IREE. |
 | [Output metadata](output_metadata.c) | Reads static output shapes and dtypes from IREE reflection, including unsigned types recorded in the ABI encoding. |
@@ -36,9 +37,17 @@ options and unsupported output signatures return errors. Output dtypes and
 shapes are available from PJRT before execution and checked against the
 runtime buffers after a call.
 
-IREE manages Vulkan allocation and transfer, and the PJRT callbacks return
-completed events for synchronous operations. Host callbacks and distributed
-execution are outside this implementation.
+IREE manages Vulkan allocation and transfer. `Execute` returns output buffer
+metadata and a pending event after enqueueing. A dispatch thread runs requests
+in FIFO order, so a pending output can be used by the next execution on the
+same device. The job holds references to its inputs, outputs, and executable
+until completion, including after their public handles are deleted. `Await`
+blocks on the event, and pending `OnReady` callbacks run on a separate thread.
+Worker failures complete the corresponding event with an error and propagate
+to its dependents. Host transfers still run synchronously, and a readback
+waits for the producing event before taking the socket lock. The Android
+worker runs one IREE invocation at a time. Host send/receive callbacks and
+distributed execution are outside this implementation.
 
 ## Build and check
 
@@ -52,6 +61,7 @@ $deviceDir = '/data/local/tmp/jax-mali-train.qCUUWZ'
 adb push build/pjrt "$deviceDir/"
 adb shell -T sh "$deviceDir/pjrt/run_on_phone.sh"
 adb shell -T sh "$deviceDir/pjrt/run_on_phone.sh" --abi
+adb shell -T sh "$deviceDir/pjrt/run_on_phone.sh" --async
 adb shell -T sh "$deviceDir/pjrt/run_on_phone.sh" --cache
 adb shell -T sh "$deviceDir/pjrt/run_on_phone.sh" --missing-worker
 adb shell -T sh "$deviceDir/pjrt/run_on_phone.sh" --disconnect
@@ -77,9 +87,13 @@ intermediate weights on Mali and reduce the loss from 14.500000 to 0.202128.
 The C ABI test queries output shapes and types before execution and checks
 rejection of malformed options, extra replicas or partitions, the wrong
 device assignment, and custom XLA debug options. The missing-worker check
-exercises backend initialization failure. The disconnect check stops its own
-worker after compilation and verifies that execution and readback report
-`UNAVAILABLE` with the failed operation name.
+exercises backend initialization failure. The `--async` C ABI check pauses its
+worker and submits two dependent executions. It checks pending events and
+output metadata, deletes the original inputs and executable, then resumes
+the worker and checks the readback. A completion callback also waits on the
+second event. The `--disconnect` JAX check queues two dependent calls while
+its worker is paused, then kills the worker and checks that both waits and a
+readback report `UNAVAILABLE` with operation context.
 
 ## Reuse a compiled executable after restart
 

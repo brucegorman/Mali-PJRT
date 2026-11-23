@@ -4,12 +4,19 @@
 真机是 vivo Y36m（Mali-G57 MC2，Android 13，GPU 驱动 Vulkan 1.1.177）。
 完成一个 part 时，把本轮复现的问题和验证结果随代码一起提交。
 
+## 同步执行会卡住 JIT 提交
+
+- **触发**：编译并上传后用 `SIGSTOP` 暂停测试 worker，再提交两次有依赖的执行。
+- **原因**：旧 `Execute` 持有 socket 锁等整次执行回包，只有回包后才能构造输出和 ready event。
+- **修复**：PJRT 预建输出和 pending event，由后台线程按队列顺序运行。任务持有远端资源引用，完成后通知等待者。回调由独立线程执行，可以等待后续任务。
+- **回归**：`--async` 验证暂停期间照常提交、event 未完成和提前删除输入与 executable；恢复后验证输出和回调。`--disconnect` 验证暂停期间 JAX 能串两次编译好的调用，worker 退出后两个结果都报执行错误。
+
 ## Worker 退出时，JAX 错误缺少失败操作
 
 - **触发**：在手机上完成 JIT 编译和输入上传后终止本次测试启动的 Mali worker，再执行 JIT。
 - **实测**：旧版本只返回 `UNAVAILABLE: Lost connection to Mali worker`，无法从消息判断失败发生在执行还是数据传输。
 - **修复**：错误包含当前 worker 操作，并区分发送失败、接收失败、无效回复和连接已关闭。
-- **回归**：`run_on_phone.sh --disconnect` 等待 worker 退出，再验证 JIT 执行和读取原输入都返回带操作名的 `UNAVAILABLE`。
+- **回归**：`run_on_phone.sh --disconnect` 等待 worker 退出，再验证等待执行结果和读取原输入都返回带操作名的 `UNAVAILABLE`。
 
 ## JAX 0.6.1 的自动磁盘缓存跳过 Mali 插件
 

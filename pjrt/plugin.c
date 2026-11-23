@@ -133,17 +133,27 @@ static PJRT_Error *client_create(PJRT_Client_Create_Args *args) {
     client->devices[0] = &client->device;
     client->memory.client = client;
     client->memories[0] = &client->memory;
+    if (!start_dispatch(client)) {
+        free_client(client);
+        return make_error(PJRT_Error_Code_INTERNAL, "Could not start Mali dispatch threads");
+    }
     args->client = client;
     return NULL;
 }
 
-static PJRT_Error *client_destroy(PJRT_Client_Destroy_Args *args) {
-    if (args->client->worker >= 0) {
-        close(args->client->worker);
+void free_client(PJRT_Client *client) {
+    if (client->worker >= 0) {
+        close(client->worker);
     }
-    pthread_mutex_destroy(&args->client->worker_lock);
-    free(args->client->default_debug_options);
-    free(args->client);
+    pthread_mutex_destroy(&client->worker_lock);
+    free(client->default_debug_options);
+    free(client);
+}
+
+static PJRT_Error *client_destroy(PJRT_Client_Destroy_Args *args) {
+    if (args->client != NULL) {
+        stop_dispatch(args->client);
+    }
     return NULL;
 }
 
@@ -355,6 +365,7 @@ static PJRT_Api api = {
 };
 
 static void initialize_api(void) {
+    register_event_api(&api);
     register_buffer_api(&api);
     register_executable_api(&api);
 }

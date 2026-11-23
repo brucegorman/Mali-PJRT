@@ -26,7 +26,8 @@ struct PJRT_Executable {
 
 struct PJRT_LoadedExecutable {
     PJRT_Client *client;
-    uint64_t handle;
+    struct mali_resource *resource;
+    size_t output_sizes[MALI_MAX_OUTPUTS];
     PJRT_Executable executable;
 };
 
@@ -109,6 +110,11 @@ static PJRT_Error *load_image(PJRT_Client *client, const char *path, struct exec
     if (loaded == NULL) {
         return make_error(PJRT_Error_Code_RESOURCE_EXHAUSTED, "Could not allocate Mali executable");
     }
+    loaded->resource = create_resource(client, MALI_UNLOAD, 0, ready_event());
+    if (loaded->resource == NULL) {
+        free(loaded);
+        return make_error(PJRT_Error_Code_RESOURCE_EXHAUSTED, "Could not allocate Mali executable handle");
+    }
     struct mali_request request = {.operation = MALI_LOAD};
     struct mali_reply reply;
     struct mali_executable_info info;
@@ -117,18 +123,28 @@ static PJRT_Error *load_image(PJRT_Client *client, const char *path, struct exec
                           &info, sizeof(info), &reply);
     pthread_mutex_unlock(&client->worker_lock);
     if (status != MALI_OK) {
+        release_resource(loaded->resource);
         free(loaded);
         return transfer_error(MALI_LOAD, status);
     }
     loaded->client = client;
-    loaded->handle = reply.handle;
-    loaded->executable.image = image;
-    retain_image(image);
+    loaded->resource->handle = reply.handle;
+    if (reply.handle == 0 || info.inputs > MALI_TRANSFER_CHUNK / sizeof(uint64_t) ||
+        info.outputs > MALI_MAX_OUTPUTS) {
+        release_resource(loaded->resource);
+        free(loaded);
+        return make_error(PJRT_Error_Code_INTERNAL, "Invalid Mali executable metadata");
+    }
     loaded->executable.inputs = info.inputs;
     loaded->executable.outputs = info.outputs;
     size_t dim_offset = 0;
     for (uint32_t i = 0; i < info.outputs; ++i) {
         const struct mali_tensor *tensor = &info.output_tensors[i];
+        if (!tensor_size(tensor, &loaded->output_sizes[i])) {
+            release_resource(loaded->resource);
+            free(loaded);
+            return make_error(PJRT_Error_Code_UNIMPLEMENTED, "Unsupported Mali output storage size");
+        }
         loaded->executable.memory_kinds[i] = "device";
         loaded->executable.memory_kind_sizes[i] = sizeof("device") - 1;
         loaded->executable.output_types[i] = tensor->type;
@@ -137,6 +153,8 @@ static PJRT_Error *load_image(PJRT_Client *client, const char *path, struct exec
                tensor->rank * sizeof(tensor->dims[0]));
         dim_offset += tensor->rank;
     }
+    loaded->executable.image = image;
+    retain_image(image);
     snprintf(loaded->executable.fingerprint, sizeof(loaded->executable.fingerprint),
              "%016" PRIx64, image_fingerprint(image));
     *out = loaded;
@@ -181,65 +199,82 @@ static PJRT_Error *loaded_execute(PJRT_LoadedExecutable_Execute_Args *args) {
         (args->options != NULL && (args->options->num_send_ops || args->options->num_recv_ops))) {
         return make_error(PJRT_Error_Code_INVALID_ARGUMENT, "Unsupported Mali execution configuration");
     }
-    uint64_t handles[MALI_TRANSFER_CHUNK / sizeof(uint64_t)];
-    struct mali_result results[MALI_MAX_OUTPUTS];
-    struct mali_reply reply;
-    pthread_mutex_lock(&client->worker_lock);
-    if (loaded->handle == 0) {
-        pthread_mutex_unlock(&client->worker_lock);
-        return make_error(PJRT_Error_Code_FAILED_PRECONDITION, "Mali executable was deleted");
+    size_t inputs = args->num_args;
+    struct mali_execution *job = calloc(1, sizeof(*job) + (inputs + outputs) * sizeof(job->buffers[0]));
+    PJRT_Event *done = create_event();
+    PJRT_Buffer *out[MALI_MAX_OUTPUTS];
+    size_t created = 0;
+    PJRT_Error *error = NULL;
+    if (job == NULL || done == NULL) {
+        error = make_error(PJRT_Error_Code_RESOURCE_EXHAUSTED, "Could not allocate Mali execution");
+        goto cleanup;
     }
-    for (size_t i = 0; i < args->num_args; ++i) {
-        PJRT_Buffer *input = args->argument_lists[0][i];
-        if (input->client != client || input->handle == 0) {
-            pthread_mutex_unlock(&client->worker_lock);
-            return make_error(PJRT_Error_Code_INVALID_ARGUMENT, "Invalid Mali execution input");
+    job->done = done;
+    job->inputs = inputs;
+    job->outputs = outputs;
+    size_t dim_offset = 0;
+    for (; created < outputs; ++created) {
+        struct mali_tensor tensor = {
+            .size = loaded->output_sizes[created],
+            .type = loaded->executable.output_types[created],
+            .rank = loaded->executable.output_ranks[created],
+        };
+        memcpy(tensor.dims, loaded->executable.output_dims + dim_offset,
+               tensor.rank * sizeof(tensor.dims[0]));
+        dim_offset += tensor.rank;
+        out[created] = create_buffer(client, &tensor, done);
+        if (out[created] == NULL) {
+            error = make_error(PJRT_Error_Code_RESOURCE_EXHAUSTED, "Could not record Mali outputs");
+            goto cleanup;
         }
-        handles[i] = input->handle;
+        job->buffers[inputs + created] = out[created]->resource;
+        job->output_sizes[created] = tensor.size;
     }
-    struct mali_request request = {.operation = MALI_EXECUTE, .handle = loaded->handle};
-    int status = exchange(client, &request, handles, args->num_args * sizeof(handles[0]),
-                          results, outputs * sizeof(results[0]), &reply);
-    if (status != MALI_OK) {
-        pthread_mutex_unlock(&client->worker_lock);
-        return transfer_error(MALI_EXECUTE, status);
+
+    pthread_mutex_lock(&client->dispatch_lock);
+    if (loaded->resource == NULL || client->stop_dispatch) {
+        pthread_mutex_unlock(&client->dispatch_lock);
+        error = make_error(PJRT_Error_Code_FAILED_PRECONDITION, "Mali executable or client was closed");
+        goto cleanup;
+    }
+    for (size_t i = 0; i < inputs; ++i) {
+        PJRT_Buffer *input = args->argument_lists[0][i];
+        if (input == NULL || input->client != client || input->resource == NULL) {
+            pthread_mutex_unlock(&client->dispatch_lock);
+            error = make_error(PJRT_Error_Code_INVALID_ARGUMENT, "Invalid Mali execution input");
+            goto cleanup;
+        }
+        job->buffers[i] = input->resource;
+    }
+    job->executable = loaded->resource;
+    retain_resource(job->executable);
+    for (size_t i = 0; i < inputs + outputs; ++i) {
+        retain_resource(job->buffers[i]);
     }
     for (size_t i = 0; i < outputs; ++i) {
-        args->output_lists[0][i] = create_buffer(client, &results[i].tensor, results[i].handle);
-        if (args->output_lists[0][i] == NULL) {
-            for (size_t j = 0; j < outputs; ++j) {
-                release_handle(client, results[j].handle);
-            }
-            for (size_t j = 0; j < i; ++j) {
-                free(args->output_lists[0][j]);
-                args->output_lists[0][j] = NULL;
-            }
-            pthread_mutex_unlock(&client->worker_lock);
-            return make_error(PJRT_Error_Code_RESOURCE_EXHAUSTED, "Could not record Mali outputs");
-        }
+        args->output_lists[0][i] = out[i];
     }
-    pthread_mutex_unlock(&client->worker_lock);
     if (args->device_complete_events != NULL) {
-        args->device_complete_events[0] = buffer_ready();
+        retain_event(done);
+        args->device_complete_events[0] = done;
     }
+    enqueue_execution(client, job);
+    pthread_mutex_unlock(&client->dispatch_lock);
     return NULL;
-}
 
-static void unload(PJRT_LoadedExecutable *loaded) {
-    PJRT_Client *client = loaded->client;
-    pthread_mutex_lock(&client->worker_lock);
-    if (loaded->handle != 0) {
-        struct mali_request request = {.operation = MALI_UNLOAD, .handle = loaded->handle};
-        struct mali_reply reply;
-        exchange(client, &request, NULL, 0, NULL, 0, &reply);
-        loaded->handle = 0;
+cleanup:
+    for (size_t i = 0; i < created; ++i) {
+        release_resource(out[i]->resource);
+        free(out[i]);
     }
-    pthread_mutex_unlock(&client->worker_lock);
+    release_event(done);
+    free(job);
+    return error;
 }
 
 static PJRT_Error *loaded_destroy(PJRT_LoadedExecutable_Destroy_Args *args) {
     if (args->executable != NULL) {
-        unload(args->executable);
+        delete_resource(args->executable->client, &args->executable->resource);
         release_image(args->executable->executable.image);
         free(args->executable);
     }
@@ -247,15 +282,12 @@ static PJRT_Error *loaded_destroy(PJRT_LoadedExecutable_Destroy_Args *args) {
 }
 
 static PJRT_Error *loaded_delete(PJRT_LoadedExecutable_Delete_Args *args) {
-    unload(args->executable);
+    delete_resource(args->executable->client, &args->executable->resource);
     return NULL;
 }
 
 static PJRT_Error *loaded_is_deleted(PJRT_LoadedExecutable_IsDeleted_Args *args) {
-    pthread_mutex_t *lock = &args->executable->client->worker_lock;
-    pthread_mutex_lock(lock);
-    args->is_deleted = args->executable->handle == 0;
-    pthread_mutex_unlock(lock);
+    args->is_deleted = resource_deleted(args->executable->client, &args->executable->resource);
     return NULL;
 }
 

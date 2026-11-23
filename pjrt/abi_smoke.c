@@ -1,7 +1,13 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include <dlfcn.h>
+#include <semaphore.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "pjrt_c_api.h"
 
@@ -39,8 +45,190 @@ static void check_error(PJRT_Error *error, PJRT_Error_Code expected_code, const 
     }
 }
 
+static PJRT_Buffer *upload(PJRT_Client *client, const void *data, PJRT_Buffer_Type type,
+                           const int64_t *dims, size_t rank) {
+    PJRT_Client_BufferFromHostBuffer_Args args = {
+        .struct_size = PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE,
+        .client = client, .data = data, .type = type, .dims = dims, .num_dims = rank,
+        .host_buffer_semantics = PJRT_HostBufferSemantics_kImmutableOnlyDuringCall,
+    };
+    check_error(api->PJRT_Client_BufferFromHostBuffer(&args), 0, NULL);
+    PJRT_Event_Destroy_Args done = {
+        .struct_size = PJRT_Event_Destroy_Args_STRUCT_SIZE, .event = args.done_with_host_buffer,
+    };
+    check_error(api->PJRT_Event_Destroy(&done), 0, NULL);
+    return args.buffer;
+}
+
+static void destroy_buffer(PJRT_Buffer *buffer) {
+    PJRT_Buffer_Destroy_Args args = {
+        .struct_size = PJRT_Buffer_Destroy_Args_STRUCT_SIZE, .buffer = buffer,
+    };
+    check_error(api->PJRT_Buffer_Destroy(&args), 0, NULL);
+}
+
+static void destroy_event(PJRT_Event *event) {
+    PJRT_Event_Destroy_Args args = {
+        .struct_size = PJRT_Event_Destroy_Args_STRUCT_SIZE, .event = event,
+    };
+    check_error(api->PJRT_Event_Destroy(&args), 0, NULL);
+}
+
+static void await(PJRT_Event *event, PJRT_Error_Code code, const char *message) {
+    PJRT_Event_Await_Args args = {
+        .struct_size = PJRT_Event_Await_Args_STRUCT_SIZE, .event = event,
+    };
+    check_error(api->PJRT_Event_Await(&args), code, message);
+}
+
+static void expect_pending(PJRT_Event *event) {
+    PJRT_Event_IsReady_Args args = {
+        .struct_size = PJRT_Event_IsReady_Args_STRUCT_SIZE, .event = event,
+    };
+    check_error(api->PJRT_Event_IsReady(&args), 0, NULL);
+    expect(!args.is_ready, "Mali event was ready before the worker resumed");
+}
+
+static PJRT_Event *buffer_event(PJRT_Buffer *buffer) {
+    PJRT_Buffer_ReadyEvent_Args args = {
+        .struct_size = PJRT_Buffer_ReadyEvent_Args_STRUCT_SIZE, .buffer = buffer,
+    };
+    check_error(api->PJRT_Buffer_ReadyEvent(&args), 0, NULL);
+    return args.event;
+}
+
+static PJRT_Event *dispatch(PJRT_LoadedExecutable *executable, PJRT_Buffer **inputs,
+                            PJRT_Buffer **outputs) {
+    PJRT_Buffer *const *argument_lists[] = {inputs};
+    PJRT_Buffer **output_lists[] = {outputs};
+    PJRT_Event *done = NULL;
+    PJRT_LoadedExecutable_Execute_Args args = {
+        .struct_size = PJRT_LoadedExecutable_Execute_Args_STRUCT_SIZE, .executable = executable,
+        .argument_lists = argument_lists, .num_devices = 1, .num_args = 2,
+        .output_lists = output_lists, .device_complete_events = &done,
+    };
+    check_error(api->PJRT_LoadedExecutable_Execute(&args), 0, NULL);
+    expect(done != NULL, "Execute did not return a completion event");
+    return done;
+}
+
+struct callback_test {
+    PJRT_Event *dependent;
+    sem_t ran;
+};
+
+static void on_first_ready(PJRT_Error *error, void *opaque) {
+    struct callback_test *test = opaque;
+    check_error(error, 0, NULL);
+    // This re-entry must not block dispatch of the second job.
+    await(test->dependent, 0, NULL);
+    expect(sem_post(&test->ran) == 0, "Could not signal the completion callback");
+}
+
+static void pause_worker(pid_t worker) {
+    expect(kill(worker, SIGSTOP) == 0, "Could not stop the test worker");
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%ld/status", (long)worker);
+    for (;;) {
+        FILE *status = fopen(path, "r");
+        expect(status != NULL, "Could not read the test worker state");
+        char line[256];
+        bool stopped = false;
+        while (fgets(line, sizeof(line), status) != NULL) {
+            if (strncmp(line, "State:", 6) == 0) {
+                stopped = line[6 + strspn(line + 6, " \t")] == 'T';
+                break;
+            }
+        }
+        fclose(status);
+        if (stopped) {
+            return;
+        }
+        nanosleep(&(struct timespec){.tv_nsec = 1000000}, NULL);
+    }
+}
+
+static void check_async(PJRT_Client *client, PJRT_LoadedExecutable *executable, pid_t worker) {
+    const uint32_t values[] = {0, 1, 2, 3, 4, UINT32_MAX};
+    const float scalar = 2.5f;
+    PJRT_Buffer *source[] = {
+        upload(client, values, PJRT_Buffer_Type_U32, (const int64_t[]){2, 3}, 2),
+        upload(client, &scalar, PJRT_Buffer_Type_F32, NULL, 0),
+    };
+    alarm(15);
+    pause_worker(worker);
+    PJRT_Buffer *first[2], *second[2];
+    PJRT_Event *first_done = dispatch(executable, source, first);
+    PJRT_Event *second_done = dispatch(executable, first, second);
+    expect_pending(first_done);
+    expect_pending(second_done);
+    PJRT_Event *first_buffer_ready = buffer_event(first[0]);
+    expect_pending(first_buffer_ready);
+    PJRT_Buffer_OnDeviceSizeInBytes_Args size = {
+        .struct_size = PJRT_Buffer_OnDeviceSizeInBytes_Args_STRUCT_SIZE, .buffer = second[0],
+    };
+    check_error(api->PJRT_Buffer_OnDeviceSizeInBytes(&size), 0, NULL);
+    expect(size.on_device_size_in_bytes == sizeof(values), "Wrong pending output size");
+
+    struct callback_test callback = {.dependent = second_done};
+    expect(sem_init(&callback.ran, 0, 0) == 0, "Could not initialize callback semaphore");
+    PJRT_Event_OnReady_Args notify = {
+        .struct_size = PJRT_Event_OnReady_Args_STRUCT_SIZE, .event = first_done,
+        .callback = on_first_ready, .user_arg = &callback,
+    };
+    check_error(api->PJRT_Event_OnReady(&notify), 0, NULL);
+    destroy_event(first_done);
+
+    PJRT_Buffer_Delete_Args delete = {
+        .struct_size = PJRT_Buffer_Delete_Args_STRUCT_SIZE, .buffer = first[0],
+    };
+    check_error(api->PJRT_Buffer_Delete(&delete), 0, NULL);
+    PJRT_Event *deleted = buffer_event(first[0]);
+    await(deleted, PJRT_Error_Code_FAILED_PRECONDITION, "Mali buffer was deleted");
+    destroy_event(deleted);
+    expect_pending(first_buffer_ready);
+    for (size_t i = 0; i < 2; ++i) {
+        destroy_buffer(source[i]);
+        destroy_buffer(first[i]);
+    }
+    PJRT_LoadedExecutable_Destroy_Args unload = {
+        .struct_size = PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE, .executable = executable,
+    };
+    check_error(api->PJRT_LoadedExecutable_Destroy(&unload), 0, NULL);
+    expect(kill(worker, SIGCONT) == 0, "Could not resume the test worker");
+
+    await(second_done, 0, NULL);
+    await(first_buffer_ready, 0, NULL);
+    expect(sem_wait(&callback.ran) == 0, "Completion callback did not run");
+    sem_destroy(&callback.ran);
+    destroy_event(first_buffer_ready);
+    destroy_event(second_done);
+
+    uint32_t result[6];
+    float scalar_result;
+    PJRT_Buffer_ToHostBuffer_Args read = {
+        .struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE,
+        .src = second[0], .dst = result, .dst_size = sizeof(result),
+    };
+    check_error(api->PJRT_Buffer_ToHostBuffer(&read), 0, NULL);
+    await(read.event, 0, NULL);
+    destroy_event(read.event);
+    read.src = second[1];
+    read.dst = &scalar_result;
+    read.dst_size = sizeof(scalar_result);
+    check_error(api->PJRT_Buffer_ToHostBuffer(&read), 0, NULL);
+    await(read.event, 0, NULL);
+    destroy_event(read.event);
+    expect(memcmp(values, result, sizeof(values)) == 0 && scalar_result == scalar,
+           "Queued results were wrong after deleting their inputs and executable");
+    destroy_buffer(second[0]);
+    destroy_buffer(second[1]);
+    alarm(0);
+    puts("PASS: pending events, two queued executions, early deletion, and reentrant callback");
+}
+
 int main(int argc, char **argv) {
-    expect(argc == 2, "Usage: abi_smoke LIBPJRT_PATH");
+    expect(argc == 2 || argc == 3, "Usage: abi_smoke LIBPJRT_PATH [WORKER_PID]");
     void *library = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     expect(library != NULL, library == NULL ? dlerror() : "");
     const PJRT_Api *(*get_api)(void) = (const PJRT_Api *(*)(void))dlsym(library, "GetPjrtApi");
@@ -111,6 +299,12 @@ int main(int argc, char **argv) {
     expect(dims.num_outputs == 2 && dims.dim_sizes[0] == 2 && dims.dim_sizes[1] == 0 &&
            dims.dims[0] == 2 && dims.dims[1] == 3, "Wrong output shapes before execution");
     puts("PASS: PJRT C API reported uint32[2,3] and scalar float32 before execution");
+    if (argc == 3) {
+        long worker = strtol(argv[2], NULL, 10);
+        expect(worker > 1 && worker <= INT32_MAX, "Invalid test worker PID");
+        check_async(create.client, compile.executable, (pid_t)worker);
+        compile.executable = NULL;
+    }
 
     PJRT_Executable_Destroy_Args destroy_executable = {
         .struct_size = PJRT_Executable_Destroy_Args_STRUCT_SIZE, .executable = describe.executable,
