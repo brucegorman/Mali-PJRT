@@ -17,6 +17,7 @@ handles so a caller can pass the results into another JIT call.
 | [Android worker](worker.c) | `open_vulkan()` opens an Arm Vulkan 1.1 device. `serve_client()` holds it until the PJRT client disconnects. |
 | [PJRT buffer callbacks](buffer.c) | Transfers bytes in chunks and keeps the worker handle, shape, and dtype. |
 | [PJRT executable callbacks](executable.c) | Invokes the arm64 IREE compiler, loads an executable, and dispatches it by handle. |
+| [Executable images](executable_image.c) | Serializes VMFB with a versioned header and validates device, driver, compiler revision, and checksum on reload. |
 | [Compile options](compile_options.c) | Validates the pinned XLA options for one local device before starting IREE. |
 | [Output metadata](output_metadata.c) | Reads static output shapes and dtypes from IREE reflection, including unsigned types recorded in the ABI encoding. |
 | [Worker buffers and execution](worker_buffers.c) | Holds the Vulkan HAL buffer views and the IREE sessions that run compiled modules. |
@@ -36,8 +37,8 @@ shapes are available from PJRT before execution and checked against the
 runtime buffers after a call.
 
 IREE manages Vulkan allocation and transfer, and the PJRT callbacks return
-completed events for synchronous operations. Executable serialization,
-host callbacks, and distributed execution are outside this implementation.
+completed events for synchronous operations. Host callbacks and distributed
+execution are outside this implementation.
 
 ## Build and check
 
@@ -51,6 +52,7 @@ $deviceDir = '/data/local/tmp/jax-mali-train.qCUUWZ'
 adb push build/pjrt "$deviceDir/"
 adb shell -T sh "$deviceDir/pjrt/run_on_phone.sh"
 adb shell -T sh "$deviceDir/pjrt/run_on_phone.sh" --abi
+adb shell -T sh "$deviceDir/pjrt/run_on_phone.sh" --cache
 adb shell -T sh "$deviceDir/pjrt/run_on_phone.sh" --missing-worker
 ```
 
@@ -75,6 +77,48 @@ The C ABI test queries output shapes and types before execution and checks
 rejection of malformed options, extra replicas or partitions, the wrong
 device assignment, and custom XLA debug options. The missing-worker check
 exercises backend initialization failure.
+
+## Reuse a compiled executable after restart
+
+Compile once in Python on the phone and save the executable bytes:
+
+```python
+from pathlib import Path
+
+import jax
+from training_fixture import train_eight_steps
+
+compiled = jax.jit(train_eight_steps).lower(weights, inputs, targets).compile()
+device = weights.device
+Path("train.malivmfb").write_bytes(
+    device.client.serialize_executable(compiled.runtime_executable())
+)
+```
+
+In a new JAX process with the worker running, upload the inputs, then load and
+execute the saved image:
+
+```python
+from pathlib import Path
+
+import jax
+
+device, = jax.devices("mali")
+executable = device.client.deserialize_executable(
+    Path("train.malivmfb").read_bytes(), executable_devices=[device]
+)
+weights, = executable.execute([weights, inputs, targets])
+```
+
+The arguments in the second example are arrays placed on that process's
+Mali device. The loader checks the executable format version, IREE revision,
+Vulkan driver and pipeline cache UUID, and a checksum of the VMFB bytes.
+The pinned JAX 0.6.1 automatic cache has a platform allowlist that excludes
+`mali`. Use the explicit save and load calls for this version.
+
+The `--cache` smoke test writes an image, exits, and starts a fresh worker and
+Python process. The second process unsets the compiler path, rejects altered
+images, and runs the saved training twice without compiling.
 
 ## Android 调试入门
 

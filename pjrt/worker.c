@@ -81,7 +81,10 @@ static bool open_vulkan(struct mali_vulkan *vulkan) {
             .device_id = properties.deviceID,
             .api_version = properties.apiVersion,
             .queue_family = family,
+            .driver_version = properties.driverVersion,
         };
+        memcpy(vulkan->info.pipeline_cache_uuid, properties.pipelineCacheUUID,
+               sizeof(vulkan->info.pipeline_cache_uuid));
         snprintf(vulkan->info.name, sizeof(vulkan->info.name), "%s", properties.deviceName);
         free(devices);
         iree_runtime_instance_options_t options;

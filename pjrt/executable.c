@@ -5,18 +5,17 @@
 #include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include "plugin_internal.h"
+#include "executable_image.h"
 
 extern char **environ;
 
 struct PJRT_Executable {
     uint32_t inputs;
     uint32_t outputs;
-    int64_t generated_size;
+    struct executable_image *image;
     char fingerprint[17];
     const char *memory_kinds[MALI_MAX_OUTPUTS];
     size_t memory_kind_sizes[MALI_MAX_OUTPUTS];
@@ -31,7 +30,11 @@ struct PJRT_LoadedExecutable {
     PJRT_Executable executable;
 };
 
-static bool write_program(int fd, const char *data, size_t size) {
+struct PJRT_SerializedExecutable {
+    struct executable_image *image;
+};
+
+static bool write_file(int fd, const char *data, size_t size) {
     while (size != 0) {
         ssize_t count = write(fd, data, size);
         if (count < 0 && errno == EINTR) {
@@ -47,8 +50,7 @@ static bool write_program(int fd, const char *data, size_t size) {
 }
 
 static PJRT_Error *compile_module(const PJRT_Program *program, const char *target,
-                                  char *output, size_t output_capacity,
-                                  int64_t *generated_size) {
+                                  char *output, size_t output_capacity) {
     const char *loader = getenv("MALI_GLIBC_LOADER");
     const char *libraries = getenv("MALI_GLIBC_LIBRARIES");
     const char *compiler = getenv("MALI_IREE_COMPILER");
@@ -68,7 +70,7 @@ static PJRT_Error *compile_module(const PJRT_Program *program, const char *targe
         return make_error(PJRT_Error_Code_INTERNAL, "Could not create a Mali compiler input file");
     }
     snprintf(output, output_capacity, "%s.vmfb", input);
-    bool written = write_program(fd, program->code, program->code_size);
+    bool written = write_file(fd, program->code, program->code_size);
     int closed = close(fd);
     PJRT_Error *error = NULL;
     if (!written || closed != 0) {
@@ -95,64 +97,33 @@ static PJRT_Error *compile_module(const PJRT_Program *program, const char *targe
         }
     }
     unlink(input);
-    struct stat file;
-    if (error == NULL && (stat(output, &file) != 0 || file.st_size <= 0)) {
-        error = make_error(PJRT_Error_Code_INTERNAL, "IREE produced no Mali module");
-    }
     if (error != NULL) {
         unlink(output);
-    } else {
-        *generated_size = file.st_size;
     }
     return error;
 }
 
-static uint64_t program_fingerprint(uint64_t hash, const char *bytes, size_t length) {
-    for (size_t i = 0; i < length; ++i) {
-        hash = (hash ^ (unsigned char)bytes[i]) * UINT64_C(1099511628211);
-    }
-    return hash;
-}
-
-static PJRT_Error *client_compile(PJRT_Client_Compile_Args *args) {
-    args->executable = NULL;
-    if (args->program == NULL || args->program->format_size != 4 ||
-        memcmp(args->program->format, "mlir", 4) != 0 || args->program->code_size == 0) {
-        return make_error(PJRT_Error_Code_INVALID_ARGUMENT, "Mali requires a StableHLO MLIR program");
-    }
-    PJRT_Error *error = validate_compile_options(
-        args->client, args->compile_options, args->compile_options_size);
-    if (error != NULL) {
-        return error;
-    }
+static PJRT_Error *load_image(PJRT_Client *client, const char *path, struct executable_image *image,
+                              PJRT_LoadedExecutable **out) {
     PJRT_LoadedExecutable *loaded = calloc(1, sizeof(*loaded));
     if (loaded == NULL) {
         return make_error(PJRT_Error_Code_RESOURCE_EXHAUSTED, "Could not allocate Mali executable");
     }
-    char path[4096];
-    const char *name = args->client->device.description.info.name;
-    const char *target = strncmp(name, "Mali-G57", sizeof("Mali-G57") - 1) == 0
-        ? "--iree-vulkan-target=mali-g57" : NULL;
-    error = compile_module(args->program, target, path, sizeof(path),
-                           &loaded->executable.generated_size);
-    if (error != NULL) {
-        free(loaded);
-        return error;
-    }
     struct mali_request request = {.operation = MALI_LOAD};
     struct mali_reply reply;
     struct mali_executable_info info;
-    pthread_mutex_lock(&args->client->worker_lock);
-    int status = exchange(args->client, &request, path, strlen(path) + 1,
+    pthread_mutex_lock(&client->worker_lock);
+    int status = exchange(client, &request, path, strlen(path) + 1,
                           &info, sizeof(info), &reply);
-    pthread_mutex_unlock(&args->client->worker_lock);
-    unlink(path);
+    pthread_mutex_unlock(&client->worker_lock);
     if (status != MALI_OK) {
         free(loaded);
         return transfer_error(status);
     }
-    loaded->client = args->client;
+    loaded->client = client;
     loaded->handle = reply.handle;
+    loaded->executable.image = image;
+    retain_image(image);
     loaded->executable.inputs = info.inputs;
     loaded->executable.outputs = info.outputs;
     size_t dim_offset = 0;
@@ -166,14 +137,39 @@ static PJRT_Error *client_compile(PJRT_Client_Compile_Args *args) {
                tensor->rank * sizeof(tensor->dims[0]));
         dim_offset += tensor->rank;
     }
-    uint64_t hash = program_fingerprint(UINT64_C(14695981039346656037),
-                                        args->program->code, args->program->code_size);
-    hash = program_fingerprint(hash, args->compile_options, args->compile_options_size);
-    hash = program_fingerprint(hash, name, strlen(name));
     snprintf(loaded->executable.fingerprint, sizeof(loaded->executable.fingerprint),
-             "%016" PRIx64, hash);
-    args->executable = loaded;
+             "%016" PRIx64, image_fingerprint(image));
+    *out = loaded;
     return NULL;
+}
+
+static PJRT_Error *client_compile(PJRT_Client_Compile_Args *args) {
+    args->executable = NULL;
+    if (args->program == NULL || args->program->format_size != 4 ||
+        memcmp(args->program->format, "mlir", 4) != 0 || args->program->code_size == 0) {
+        return make_error(PJRT_Error_Code_INVALID_ARGUMENT, "Mali requires a StableHLO MLIR program");
+    }
+    PJRT_Error *error = validate_compile_options(
+        args->client, args->compile_options, args->compile_options_size);
+    if (error != NULL) {
+        return error;
+    }
+    char path[4096];
+    const struct mali_device_info *device = &args->client->device.description.info;
+    const char *target = strncmp(device->name, "Mali-G57", sizeof("Mali-G57") - 1) == 0
+        ? "--iree-vulkan-target=mali-g57" : NULL;
+    error = compile_module(args->program, target, path, sizeof(path));
+    if (error != NULL) {
+        return error;
+    }
+    struct executable_image *image;
+    error = read_compiled_image(path, device, &image);
+    if (error == NULL) {
+        error = load_image(args->client, path, image, &args->executable);
+        release_image(image);
+    }
+    unlink(path);
+    return error;
 }
 
 static PJRT_Error *loaded_execute(PJRT_LoadedExecutable_Execute_Args *args) {
@@ -244,6 +240,7 @@ static void unload(PJRT_LoadedExecutable *loaded) {
 static PJRT_Error *loaded_destroy(PJRT_LoadedExecutable_Destroy_Args *args) {
     if (args->executable != NULL) {
         unload(args->executable);
+        release_image(args->executable->executable.image);
         free(args->executable);
     }
     return NULL;
@@ -268,6 +265,7 @@ static PJRT_Error *loaded_get_executable(PJRT_LoadedExecutable_GetExecutable_Arg
         return make_error(PJRT_Error_Code_RESOURCE_EXHAUSTED, "Could not copy Mali executable info");
     }
     *args->executable = args->loaded_executable->executable;
+    retain_image(args->executable->image);
     return NULL;
 }
 
@@ -278,7 +276,10 @@ static PJRT_Error *loaded_devices(PJRT_LoadedExecutable_AddressableDevices_Args 
 }
 
 static PJRT_Error *executable_destroy(PJRT_Executable_Destroy_Args *args) {
-    free(args->executable);
+    if (args->executable != NULL) {
+        release_image(args->executable->image);
+        free(args->executable);
+    }
     return NULL;
 }
 
@@ -324,7 +325,7 @@ static PJRT_Error *executable_output_dimensions(PJRT_Executable_OutputDimensions
 }
 
 static PJRT_Error *executable_size(PJRT_Executable_SizeOfGeneratedCodeInBytes_Args *args) {
-    args->size_in_bytes = args->executable->generated_size;
+    args->size_in_bytes = (int64_t)image_vmfb_size(args->executable->image);
     return NULL;
 }
 
@@ -334,14 +335,52 @@ static PJRT_Error *executable_fingerprint(PJRT_Executable_Fingerprint_Args *args
     return NULL;
 }
 
+static void serialized_destroy(PJRT_SerializedExecutable *serialized) {
+    release_image(serialized->image);
+    free(serialized);
+}
+
 static PJRT_Error *executable_serialize(PJRT_Executable_Serialize_Args *args) {
-    (void)args;
-    return make_error(PJRT_Error_Code_UNIMPLEMENTED, "Mali executable serialization is unavailable");
+    PJRT_SerializedExecutable *serialized = malloc(sizeof(*serialized));
+    if (serialized == NULL) {
+        return make_error(PJRT_Error_Code_RESOURCE_EXHAUSTED, "Could not serialize the Mali executable");
+    }
+    serialized->image = args->executable->image;
+    retain_image(serialized->image);
+    args->serialized_bytes = image_serialized(serialized->image, &args->serialized_bytes_size);
+    args->serialized_executable = serialized;
+    args->serialized_executable_deleter = serialized_destroy;
+    return NULL;
 }
 
 static PJRT_Error *executable_deserialize(PJRT_Executable_DeserializeAndLoad_Args *args) {
-    (void)args;
-    return make_error(PJRT_Error_Code_UNIMPLEMENTED, "Mali executable deserialization is unavailable");
+    args->loaded_executable = NULL;
+    struct executable_image *image;
+    PJRT_Error *error = read_serialized_image(
+        args->serialized_executable, args->serialized_executable_size,
+        &args->client->device.description.info, &image);
+    if (error != NULL) {
+        return error;
+    }
+    const char *temporary = getenv("TMPDIR");
+    char path[4096];
+    int length = temporary != NULL
+        ? snprintf(path, sizeof(path), "%s/pjrt-vmfb-XXXXXX", temporary) : -1;
+    int fd = length >= 0 && (size_t)length < sizeof(path) ? mkstemp(path) : -1;
+    if (fd < 0) {
+        release_image(image);
+        return make_error(PJRT_Error_Code_INTERNAL, "Could not stage the cached Mali module");
+    }
+    bool written = write_file(fd, image_vmfb(image), image_vmfb_size(image));
+    int closed = close(fd);
+    if (written && closed == 0) {
+        error = load_image(args->client, path, image, &args->loaded_executable);
+    } else {
+        error = make_error(PJRT_Error_Code_INTERNAL, "Could not write the cached Mali module");
+    }
+    unlink(path);
+    release_image(image);
+    return error;
 }
 
 static PJRT_Error *executable_optimized_program(PJRT_Executable_OptimizedProgram_Args *args) {

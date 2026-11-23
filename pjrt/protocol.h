@@ -10,8 +10,8 @@
 #include <sys/un.h>
 #include <sys/uio.h>
 
-#define MALI_PJRT_HELLO "MALI-PJRT/5 HELLO"
-#define MALI_PJRT_PROTOCOL_VERSION 5
+#define MALI_PJRT_HELLO "MALI-PJRT/6 HELLO"
+#define MALI_PJRT_PROTOCOL_VERSION 6
 #define MALI_VULKAN_VENDOR_ID 0x13b5u
 #define MALI_TRANSFER_CHUNK (64 * 1024u)
 #define MALI_MAX_RANK 64
@@ -24,10 +24,12 @@ struct mali_device_info {
     uint32_t device_id;
     uint32_t api_version;
     uint32_t queue_family;
+    uint32_t driver_version;
+    unsigned char pipeline_cache_uuid[16];
     char name[256];
 };
 
-_Static_assert(sizeof(struct mali_device_info) == 276, "Unexpected device packet layout");
+_Static_assert(sizeof(struct mali_device_info) == 296, "Unexpected device packet layout");
 
 enum mali_operation {
     MALI_ALLOCATE = 1,

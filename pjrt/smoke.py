@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import select
 import subprocess
+import tempfile
 import uuid
 
 def check_device(missing_worker):
@@ -138,41 +139,79 @@ def check_device(missing_worker):
     print(f"weights={final.tolist()}", flush=True)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--missing-worker", action="store_true")
-    mode.add_argument("--abi", action="store_true", help="Check compile options and output metadata via C")
-    parser.add_argument("--client", action="store_true", help=argparse.SUPPRESS)
-    args = parser.parse_args()
-    if args.client:
-        check_device(args.missing_worker)
+def check_cache(path, write):
+    import jax
+    import numpy as np
+    from training_fixture import train_eight_steps
+
+    jax.config.update("jax_platforms", "mali")
+    if not write:
+        os.environ.pop("MALI_IREE_COMPILER", None)
+    device, = jax.devices("mali")
+    client = device.client
+    initial = np.array([1, 2], dtype=np.float32)
+    target = np.array([3, 7], dtype=np.float32)
+    weights, inputs, targets = (
+        jax.device_put(data, device) for data in (initial, np.eye(2, dtype=np.float32), target)
+    )
+    if write:
+        compiled = jax.jit(train_eight_steps).lower(weights, inputs, targets).compile()
+        blob = client.serialize_executable(compiled.runtime_executable())
+        path.write_bytes(blob)
+        print(f"PASS: process {os.getpid()} compiled and saved {len(blob)} executable bytes", flush=True)
         return
 
-    package = Path(__file__).resolve().parent
+    blob = path.read_bytes()
+    bad_magic = bytes([blob[0] ^ 1]) + blob[1:]
+    bad_code = blob[:-1] + bytes([blob[-1] ^ 1])
+    bad_driver = bytearray(blob)
+    bad_driver[44] ^= 1  # driver_version in the serialized header
+    for corrupted, expected in (
+        (bad_magic, "Invalid Mali executable image header"),
+        (bad_code, "Mali executable image checksum mismatch"),
+        (bytes(bad_driver), "targets a different device, driver, or compiler"),
+    ):
+        try:
+            client.deserialize_executable(corrupted, executable_devices=[device])
+        except RuntimeError as error:
+            if expected not in str(error):
+                raise
+        else:
+            raise RuntimeError(f"Corrupt executable should have been rejected: {expected}")
+    print("PASS: invalid header, altered VMFB, and mismatched driver were rejected", flush=True)
+
+    executable = client.deserialize_executable(blob, executable_devices=[device])
+    if client.serialize_executable(executable) != blob:
+        raise RuntimeError("Executable image changed after reloading")
+    for _ in range(2):
+        weights, = executable.execute([weights, inputs, targets])
+        if weights.device != device:
+            raise RuntimeError("Reloaded executable returned weights on the wrong device")
+    final = np.asarray(weights)
+    np.testing.assert_allclose(final, target + (initial - target) * (7 / 8) ** 16, rtol=1e-6)
+    try:
+        jax.jit(lambda value: value + 9)(weights)
+    except RuntimeError as error:
+        if "Set the phone IREE compiler environment" not in str(error):
+            raise
+    else:
+        raise RuntimeError("A fresh JIT unexpectedly reached the compiler")
+    print(f"PASS: process {os.getpid()} loaded and ran the cached training twice with no compiler",
+          flush=True)
+    print(f"cached weights={final.tolist()}", flush=True)
+
+
+def run_worker(package, command):
     socket_name = f"mali-pjrt-{uuid.uuid4().hex}"
-    os.environ["MALI_PJRT_SOCKET"] = socket_name
-    if args.missing_worker:
-        check_device(missing_worker=True)
-        return
-
+    environment = {**os.environ, "MALI_PJRT_SOCKET": socket_name}
     worker = subprocess.Popen([str(package / "mali_worker"), socket_name],
-                              stdout=subprocess.PIPE, text=True)
+                              stdout=subprocess.PIPE, text=True, env=environment)
     try:
         if not select.select([worker.stdout], [], [], 5)[0]:
             raise TimeoutError("Mali worker did not become ready")
         if worker.stdout.readline().strip() != "READY":
             raise RuntimeError("Mali worker stopped before becoming ready")
-        command = ["/system/bin/sh", str(package / "run_on_phone.sh"), "--client"]
-        if args.abi:
-            probe = package / "abi_smoke"
-            probe.chmod(0o700)
-            command = [
-                os.environ["MALI_GLIBC_LOADER"], "--library-path",
-                os.environ["MALI_GLIBC_LIBRARIES"], str(probe),
-                str(package / "jax_plugins/mali/libpjrt_mali.so"),
-            ]
-        subprocess.run(command, check=True, timeout=90)
+        subprocess.run(command, check=True, timeout=90, env=environment)
         if worker.wait(timeout=5) != 0:
             raise RuntimeError("Mali worker did not shut down cleanly")
     finally:
@@ -180,6 +219,46 @@ def main():
             worker.kill()
             worker.wait()
         worker.stdout.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--missing-worker", action="store_true")
+    mode.add_argument("--abi", action="store_true", help="Check compile options and output metadata via C")
+    mode.add_argument("--cache", action="store_true", help="Save and reload a JIT in separate processes")
+    mode.add_argument("--client", action="store_true", help=argparse.SUPPRESS)
+    mode.add_argument("--cache-write", type=Path, help=argparse.SUPPRESS)
+    mode.add_argument("--cache-read", type=Path, help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.client:
+        check_device(missing_worker=False)
+        return
+    if args.cache_write or args.cache_read:
+        check_cache(args.cache_write or args.cache_read, write=args.cache_write is not None)
+        return
+    if args.missing_worker:
+        os.environ["MALI_PJRT_SOCKET"] = f"mali-pjrt-{uuid.uuid4().hex}"
+        check_device(missing_worker=True)
+        return
+
+    package = Path(__file__).resolve().parent
+    client_command = ["/system/bin/sh", str(package / "run_on_phone.sh")]
+    if args.cache:
+        with tempfile.TemporaryDirectory(prefix="pjrt-cache-") as temporary:
+            path = str(Path(temporary) / "train.malivmfb")
+            run_worker(package, [*client_command, "--cache-write", path])
+            run_worker(package, [*client_command, "--cache-read", path])
+    elif args.abi:
+        probe = package / "abi_smoke"
+        probe.chmod(0o700)
+        run_worker(package, [
+            os.environ["MALI_GLIBC_LOADER"], "--library-path",
+            os.environ["MALI_GLIBC_LIBRARIES"], str(probe),
+            str(package / "jax_plugins/mali/libpjrt_mali.so"),
+        ])
+    else:
+        run_worker(package, [*client_command, "--client"])
 
 
 if __name__ == "__main__":

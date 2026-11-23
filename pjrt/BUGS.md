@@ -2,6 +2,17 @@
 
 每个条目记录触发条件、实测结果、修复和验证方法。除非另有说明，
 真机是 vivo Y36m（Mali-G57 MC2，Android 13，GPU 驱动 Vulkan 1.1.177）。
+完成一个 part 时，把本轮复现的问题和验证结果随代码一起提交。
+
+## JAX 0.6.1 的自动磁盘缓存跳过 Mali 插件
+
+- **触发**：为注册名为 `mali` 的后端配置 `jax_compilation_cache_dir`。
+- **原因**：该版本的自动缓存入口只接受 `tpu`、`gpu`、`cpu` 和
+  `neuron`。实现 PJRT 序列化回调后，仍需显式保存和加载。
+- **处理**：使用 JAX 的 `serialize_executable()` 和
+  `deserialize_executable()`。序列化镜像携带 VMFB 校验值和驱动标签。
+- **回归**：`run_on_phone.sh --cache` 用两个独立进程验证。第二个进程关闭
+  编译入口，拒绝错误头部、损坏的 VMFB 和不匹配的驱动，再用有效镜像跑两次训练。
 
 ## G57 上通用 Vulkan 目标产生错误的 FP16 结果
 

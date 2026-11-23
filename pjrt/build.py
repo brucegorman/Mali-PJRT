@@ -68,7 +68,8 @@ def main():
     ]
     subprocess.run([
         *compiler, *(str(SOURCE / file) for file in
-                     ("plugin.c", "buffer.c", "executable.c", "compile_options.c")),
+                     ("plugin.c", "buffer.c", "executable.c", "executable_image.c",
+                      "compile_options.c")),
         "-o", str(package / "libpjrt_mali.so"),
     ], check=True, cwd=ROOT, env=zig_env)
     subprocess.run([
