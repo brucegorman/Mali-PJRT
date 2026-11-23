@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -44,45 +45,85 @@ static PJRT_Error *event_on_ready(PJRT_Event_OnReady_Args *args) {
     return NULL;
 }
 
+enum transport_status {
+    TRANSPORT_CLOSED = -4,
+    TRANSPORT_SEND_FAILED,
+    TRANSPORT_RECEIVE_FAILED,
+    TRANSPORT_INVALID_REPLY,
+};
+
 // The caller holds worker_lock through the whole transfer. A failed transport
 // closes the connection so the worker can release all remaining allocations.
 int exchange(PJRT_Client *client, const struct mali_request *request,
              const void *input, size_t input_size, void *output, size_t output_size,
              struct mali_reply *reply) {
     if (client->worker < 0) {
-        return -1;
+        return TRANSPORT_CLOSED;
     }
+    int status = TRANSPORT_SEND_FAILED;
     if (send_packet(client->worker, request, sizeof(*request), input, input_size)) {
         ssize_t count = receive_packet(client->worker, reply, sizeof(*reply), output, output_size);
         if (count >= (ssize_t)sizeof(*reply) &&
+            reply->status <= MALI_UNSUPPORTED_SIGNATURE && reply->reserved == 0 &&
             count == (ssize_t)(sizeof(*reply) + (reply->status == MALI_OK ? output_size : 0))) {
             return (int)reply->status;
         }
+        status = count <= 0 ? TRANSPORT_RECEIVE_FAILED : TRANSPORT_INVALID_REPLY;
     }
     close(client->worker);
     client->worker = -1;
-    return -1;
+    return status;
 }
 
-PJRT_Error *transfer_error(int status) {
+PJRT_Error *transfer_error(enum mali_operation operation, int status) {
+    static const char *const names[] = {
+        [MALI_ALLOCATE] = "allocate", [MALI_WRITE] = "write", [MALI_READ] = "read",
+        [MALI_LOAD] = "load", [MALI_EXECUTE] = "execute",
+    };
+    PJRT_Error_Code code = PJRT_Error_Code_INTERNAL;
+    const char *detail;
     switch (status) {
         case MALI_OK: return NULL;
         case MALI_OUT_OF_MEMORY:
-            return make_error(PJRT_Error_Code_RESOURCE_EXHAUSTED, "Could not allocate a Vulkan buffer");
+            code = PJRT_Error_Code_RESOURCE_EXHAUSTED;
+            detail = "Vulkan runtime ran out of resources";
+            break;
         case MALI_UNSUPPORTED_MEMORY:
-            return make_error(PJRT_Error_Code_UNIMPLEMENTED, "No coherent Vulkan memory for this buffer");
+            code = PJRT_Error_Code_UNIMPLEMENTED;
+            detail = "No coherent Vulkan memory for this buffer";
+            break;
         case MALI_NOT_FOUND:
-            return make_error(PJRT_Error_Code_FAILED_PRECONDITION, "Mali handle is gone");
+            code = PJRT_Error_Code_FAILED_PRECONDITION;
+            detail = "Mali handle is gone";
+            break;
         case MALI_RUNTIME_ERROR:
-            return make_error(PJRT_Error_Code_INTERNAL, "IREE Vulkan runtime failed (see worker stderr)");
+            detail = "IREE Vulkan runtime failed (see worker stderr)";
+            break;
         case MALI_UNSUPPORTED_SIGNATURE:
-            return make_error(PJRT_Error_Code_UNIMPLEMENTED,
-                              "Mali requires a supported static tensor output signature");
-        case -1:
-            return make_error(PJRT_Error_Code_UNAVAILABLE, "Lost connection to Mali worker");
+            code = PJRT_Error_Code_UNIMPLEMENTED;
+            detail = "Mali requires a supported static tensor output signature";
+            break;
+        case TRANSPORT_CLOSED:
+            code = PJRT_Error_Code_UNAVAILABLE;
+            detail = "worker connection is closed";
+            break;
+        case TRANSPORT_SEND_FAILED:
+            code = PJRT_Error_Code_UNAVAILABLE;
+            detail = "could not send request";
+            break;
+        case TRANSPORT_RECEIVE_FAILED:
+            code = PJRT_Error_Code_UNAVAILABLE;
+            detail = "could not receive reply";
+            break;
+        case TRANSPORT_INVALID_REPLY:
+            detail = "invalid worker reply";
+            break;
         default:
-            return make_error(PJRT_Error_Code_INTERNAL, "Mali worker rejected the buffer request");
+            detail = "worker rejected the request";
     }
+    char message[160];
+    snprintf(message, sizeof(message), "Mali worker %s: %s", names[operation], detail);
+    return make_error(code, message);
 }
 
 static size_t element_size(PJRT_Buffer_Type type) {
@@ -284,12 +325,14 @@ static PJRT_Error *client_buffer_from_host(PJRT_Client_BufferFromHostBuffer_Args
     }
 
     struct mali_request request = {.operation = MALI_ALLOCATE, .length = size};
+    enum mali_operation operation = MALI_ALLOCATE;
     struct mali_reply reply;
     pthread_mutex_lock(&args->client->worker_lock);
     int status = exchange(args->client, &request, &tensor, sizeof(tensor), NULL, 0, &reply);
     if (status == MALI_OK) {
         buffer->handle = reply.handle;
-        status = transfer(buffer, MALI_WRITE, 0, size, packed != NULL ? packed : args->data, NULL);
+        operation = MALI_WRITE;
+        status = transfer(buffer, operation, 0, size, packed != NULL ? packed : args->data, NULL);
         if (status != MALI_OK) {
             release_handle(args->client, buffer->handle);
         }
@@ -298,7 +341,7 @@ static PJRT_Error *client_buffer_from_host(PJRT_Client_BufferFromHostBuffer_Args
     free(packed);
     if (status != MALI_OK) {
         free(buffer);
-        return transfer_error(status);
+        return transfer_error(operation, status);
     }
     args->buffer = buffer;
     args->done_with_host_buffer = &ready_event;
@@ -316,7 +359,7 @@ static PJRT_Error *download(PJRT_Buffer *buffer, size_t offset, size_t size, voi
     if (status == MALI_OK) {
         *event = &ready_event;
     }
-    return transfer_error(status);
+    return transfer_error(MALI_READ, status);
 }
 
 static PJRT_Error *buffer_to_host(PJRT_Buffer_ToHostBuffer_Args *args) {

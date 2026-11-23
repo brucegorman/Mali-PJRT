@@ -4,6 +4,7 @@ import argparse
 import os
 from pathlib import Path
 import select
+import signal
 import subprocess
 import tempfile
 import uuid
@@ -201,7 +202,31 @@ def check_cache(path, write):
     print(f"cached weights={final.tolist()}", flush=True)
 
 
-def run_worker(package, command):
+def check_disconnect(worker_pid, worker_stdout):
+    import jax
+    import numpy as np
+
+    device, = jax.devices("mali")
+    x = jax.device_put(np.array([1, 2], dtype=np.float32), device)
+    compiled = jax.jit(lambda value: value + value).lower(x).compile()
+    os.kill(worker_pid, signal.SIGKILL)
+    with os.fdopen(worker_stdout, "rb") as stdout:
+        if stdout.read():
+            raise RuntimeError("Unexpected output after stopping the Mali worker")
+
+    for action, operation in ((lambda: compiled(x).block_until_ready(), "execute"),
+                              (lambda: np.asarray(x), "read")):
+        try:
+            action()
+        except RuntimeError as error:
+            if "UNAVAILABLE" not in str(error) or f"Mali worker {operation}:" not in str(error):
+                raise
+        else:
+            raise RuntimeError(f"Mali worker {operation} succeeded after disconnect")
+    print("PASS: execution and readback report operation-specific errors after worker exit", flush=True)
+
+
+def run_worker(package, command, disconnect=False):
     socket_name = f"mali-pjrt-{uuid.uuid4().hex}"
     environment = {**os.environ, "MALI_PJRT_SOCKET": socket_name}
     worker = subprocess.Popen([str(package / "mali_worker"), socket_name],
@@ -211,8 +236,13 @@ def run_worker(package, command):
             raise TimeoutError("Mali worker did not become ready")
         if worker.stdout.readline().strip() != "READY":
             raise RuntimeError("Mali worker stopped before becoming ready")
-        subprocess.run(command, check=True, timeout=90, env=environment)
-        if worker.wait(timeout=5) != 0:
+        pass_fds = ()
+        if disconnect:
+            pass_fds = (worker.stdout.fileno(),)
+            command = [*command, "--disconnect-client", str(worker.pid), str(pass_fds[0])]
+        subprocess.run(command, check=True, timeout=90, env=environment, pass_fds=pass_fds)
+        expected_exit = -signal.SIGKILL if disconnect else 0
+        if worker.wait(timeout=5) != expected_exit:
             raise RuntimeError("Mali worker did not shut down cleanly")
     finally:
         if worker.poll() is None:
@@ -227,10 +257,15 @@ def main():
     mode.add_argument("--missing-worker", action="store_true")
     mode.add_argument("--abi", action="store_true", help="Check compile options and output metadata via C")
     mode.add_argument("--cache", action="store_true", help="Save and reload a JIT in separate processes")
+    mode.add_argument("--disconnect", action="store_true", help="Check errors after the worker exits")
+    mode.add_argument("--disconnect-client", nargs=2, type=int, help=argparse.SUPPRESS)
     mode.add_argument("--client", action="store_true", help=argparse.SUPPRESS)
     mode.add_argument("--cache-write", type=Path, help=argparse.SUPPRESS)
     mode.add_argument("--cache-read", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.disconnect_client:
+        check_disconnect(*args.disconnect_client)
+        return
     if args.client:
         check_device(missing_worker=False)
         return
@@ -244,7 +279,9 @@ def main():
 
     package = Path(__file__).resolve().parent
     client_command = ["/system/bin/sh", str(package / "run_on_phone.sh")]
-    if args.cache:
+    if args.disconnect:
+        run_worker(package, client_command, disconnect=True)
+    elif args.cache:
         with tempfile.TemporaryDirectory(prefix="pjrt-cache-") as temporary:
             path = str(Path(temporary) / "train.malivmfb")
             run_worker(package, [*client_command, "--cache-write", path])

@@ -45,7 +45,7 @@ PJRT_Error *make_error(PJRT_Error_Code code, const char *message);
 int exchange(PJRT_Client *client, const struct mali_request *request,
              const void *input, size_t input_size, void *output, size_t output_size,
              struct mali_reply *reply);
-PJRT_Error *transfer_error(int status);
+PJRT_Error *transfer_error(enum mali_operation operation, int status);
 PJRT_Buffer *create_buffer(PJRT_Client *client, const struct mali_tensor *tensor, uint64_t handle);
 void release_handle(PJRT_Client *client, uint64_t handle);
 PJRT_Event *buffer_ready(void);

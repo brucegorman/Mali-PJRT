@@ -4,6 +4,13 @@
 真机是 vivo Y36m（Mali-G57 MC2，Android 13，GPU 驱动 Vulkan 1.1.177）。
 完成一个 part 时，把本轮复现的问题和验证结果随代码一起提交。
 
+## Worker 退出时，JAX 错误缺少失败操作
+
+- **触发**：在手机上完成 JIT 编译和输入上传后终止本次测试启动的 Mali worker，再执行 JIT。
+- **实测**：旧版本只返回 `UNAVAILABLE: Lost connection to Mali worker`，无法从消息判断失败发生在执行还是数据传输。
+- **修复**：错误包含当前 worker 操作，并区分发送失败、接收失败、无效回复和连接已关闭。
+- **回归**：`run_on_phone.sh --disconnect` 等待 worker 退出，再验证 JIT 执行和读取原输入都返回带操作名的 `UNAVAILABLE`。
+
 ## JAX 0.6.1 的自动磁盘缓存跳过 Mali 插件
 
 - **触发**：为注册名为 `mali` 的后端配置 `jax_compilation_cache_dir`。

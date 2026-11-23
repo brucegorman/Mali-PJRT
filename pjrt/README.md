@@ -54,6 +54,7 @@ adb shell -T sh "$deviceDir/pjrt/run_on_phone.sh"
 adb shell -T sh "$deviceDir/pjrt/run_on_phone.sh" --abi
 adb shell -T sh "$deviceDir/pjrt/run_on_phone.sh" --cache
 adb shell -T sh "$deviceDir/pjrt/run_on_phone.sh" --missing-worker
+adb shell -T sh "$deviceDir/pjrt/run_on_phone.sh" --disconnect
 ```
 
 Pass `--ndk`, `--iree`, or `--host-bin` to override the existing Android
@@ -76,7 +77,9 @@ intermediate weights on Mali and reduce the loss from 14.500000 to 0.202128.
 The C ABI test queries output shapes and types before execution and checks
 rejection of malformed options, extra replicas or partitions, the wrong
 device assignment, and custom XLA debug options. The missing-worker check
-exercises backend initialization failure.
+exercises backend initialization failure. The disconnect check stops its own
+worker after compilation and verifies that execution and readback report
+`UNAVAILABLE` with the failed operation name.
 
 ## Reuse a compiled executable after restart
 

@@ -118,7 +118,7 @@ static PJRT_Error *load_image(PJRT_Client *client, const char *path, struct exec
     pthread_mutex_unlock(&client->worker_lock);
     if (status != MALI_OK) {
         free(loaded);
-        return transfer_error(status);
+        return transfer_error(MALI_LOAD, status);
     }
     loaded->client = client;
     loaded->handle = reply.handle;
@@ -202,7 +202,7 @@ static PJRT_Error *loaded_execute(PJRT_LoadedExecutable_Execute_Args *args) {
                           results, outputs * sizeof(results[0]), &reply);
     if (status != MALI_OK) {
         pthread_mutex_unlock(&client->worker_lock);
-        return transfer_error(status);
+        return transfer_error(MALI_EXECUTE, status);
     }
     for (size_t i = 0; i < outputs; ++i) {
         args->output_lists[0][i] = create_buffer(client, &results[i].tensor, results[i].handle);

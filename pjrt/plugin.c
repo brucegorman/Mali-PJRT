@@ -16,11 +16,12 @@ static PJRT_Error no_memory = {
 };
 
 PJRT_Error *make_error(PJRT_Error_Code code, const char *message) {
-    PJRT_Error *error = malloc(sizeof(*error));
+    size_t size = strlen(message) + 1;
+    PJRT_Error *error = malloc(sizeof(*error) + size);
     if (error == NULL) {
         return &no_memory;
     }
-    *error = (PJRT_Error){ .code = code, .message = message };
+    *error = (PJRT_Error){ .code = code, .message = memcpy(error + 1, message, size) };
     return error;
 }
 
