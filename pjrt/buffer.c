@@ -75,6 +75,9 @@ PJRT_Error *transfer_error(int status) {
             return make_error(PJRT_Error_Code_FAILED_PRECONDITION, "Mali handle is gone");
         case MALI_RUNTIME_ERROR:
             return make_error(PJRT_Error_Code_INTERNAL, "IREE Vulkan runtime failed (see worker stderr)");
+        case MALI_UNSUPPORTED_SIGNATURE:
+            return make_error(PJRT_Error_Code_UNIMPLEMENTED,
+                              "Mali requires a supported static tensor output signature");
         case -1:
             return make_error(PJRT_Error_Code_UNAVAILABLE, "Lost connection to Mali worker");
         default:

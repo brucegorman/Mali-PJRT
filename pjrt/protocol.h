@@ -10,8 +10,8 @@
 #include <sys/un.h>
 #include <sys/uio.h>
 
-#define MALI_PJRT_HELLO "MALI-PJRT/4 HELLO"
-#define MALI_PJRT_PROTOCOL_VERSION 4
+#define MALI_PJRT_HELLO "MALI-PJRT/5 HELLO"
+#define MALI_PJRT_PROTOCOL_VERSION 5
 #define MALI_VULKAN_VENDOR_ID 0x13b5u
 #define MALI_TRANSFER_CHUNK (64 * 1024u)
 #define MALI_MAX_RANK 64
@@ -46,6 +46,7 @@ enum mali_status {
     MALI_OUT_OF_MEMORY,
     MALI_UNSUPPORTED_MEMORY,
     MALI_RUNTIME_ERROR,
+    MALI_UNSUPPORTED_SIGNATURE,
 };
 
 struct mali_tensor {
@@ -63,6 +64,7 @@ struct mali_result {
 struct mali_executable_info {
     uint32_t inputs;
     uint32_t outputs;
+    struct mali_tensor output_tensors[MALI_MAX_OUTPUTS];
 };
 
 struct mali_request {

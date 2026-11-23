@@ -1,5 +1,7 @@
 # Mali PJRT backend
 
+[错误与复现记录](BUGS.md)
+
 JAX 0.6.1 loads a Linux arm64 PJRT library and connects to an Android arm64
 worker over an abstract Unix socket. The worker opens a Vulkan logical device
 and compute queue. JAX exposes that device through `jax.devices("mali")`.
@@ -15,12 +17,24 @@ handles so a caller can pass the results into another JIT call.
 | [Android worker](worker.c) | `open_vulkan()` opens an Arm Vulkan 1.1 device. `serve_client()` holds it until the PJRT client disconnects. |
 | [PJRT buffer callbacks](buffer.c) | Transfers bytes in chunks and keeps the worker handle, shape, and dtype. |
 | [PJRT executable callbacks](executable.c) | Invokes the arm64 IREE compiler, loads an executable, and dispatches it by handle. |
+| [Compile options](compile_options.c) | Validates the pinned XLA options for one local device before starting IREE. |
+| [Output metadata](output_metadata.c) | Reads static output shapes and dtypes from IREE reflection, including unsigned types recorded in the ABI encoding. |
 | [Worker buffers and execution](worker_buffers.c) | Holds the Vulkan HAL buffer views and the IREE sessions that run compiled modules. |
 | [Protocol](protocol.h) | Device metadata, tensor descriptions, transfers, and executable requests. |
 
 The Y36m reports a single `Mali-G57 MC2` with Vulkan 1.1.177. The backend
 supports one device, dense row-major buffers, strided host uploads, and
 conventional byte-aligned buffer types such as float32, int32, and bool.
+On Mali-G57 it explicitly compiles for IREE's `mali-g57` target. The generic
+Vulkan target produced incorrect FP16 values on this phone in the direct
+IREE runner. The device-specific target passed the FP16 JIT checks.
+
+The backend accepts the pinned JAX defaults and a single device assignment to
+device 0. Custom XLA compiler overrides, explicit XLA layouts, multi-device
+options and unsupported output signatures return errors. Output dtypes and
+shapes are available from PJRT before execution and checked against the
+runtime buffers after a call.
+
 IREE manages Vulkan allocation and transfer, and the PJRT callbacks return
 completed events for synchronous operations. Executable serialization,
 host callbacks, and distributed execution are outside this implementation.
@@ -36,6 +50,7 @@ python pjrt/build.py --zig build/pjrt-deps/zig-x86_64-windows-0.15.2/zig.exe
 $deviceDir = '/data/local/tmp/jax-mali-train.qCUUWZ'
 adb push build/pjrt "$deviceDir/"
 adb shell -T sh "$deviceDir/pjrt/run_on_phone.sh"
+adb shell -T sh "$deviceDir/pjrt/run_on_phone.sh" --abi
 adb shell -T sh "$deviceDir/pjrt/run_on_phone.sh" --missing-worker
 ```
 
@@ -52,11 +67,14 @@ in the debug commands below.
 The smoke check verifies device metadata, upload, readback and deletion for
 a multi-packet float32 matrix, a strided int32 view, a scalar, an empty array,
 and bool values. It mutates the host input after upload to verify independent
-storage. It verifies a JIT addition, a function with two outputs, and two
-eight-step training calls whose intermediate weights stay on Mali. The final
-weights match the analytical result and the loss falls from 14.500000 to
-0.202128. The worker exits when the JAX process closes its connection. The
-missing-worker check exercises backend initialization failure.
+storage. It verifies JIT addition, multiple outputs, batched matrix
+multiplication, transpose/slice/reduction, unsigned integers, booleans,
+FP16, scalars and empty arrays. Two eight-step training calls keep the
+intermediate weights on Mali and reduce the loss from 14.500000 to 0.202128.
+The C ABI test queries output shapes and types before execution and checks
+rejection of malformed options, extra replicas or partitions, the wrong
+device assignment, and custom XLA debug options. The missing-worker check
+exercises backend initialization failure.
 
 ## Android 调试入门
 

@@ -1,6 +1,7 @@
 add_executable(mali_worker
   "${CMAKE_CURRENT_LIST_DIR}/worker.c"
   "${CMAKE_CURRENT_LIST_DIR}/worker_buffers.c"
+  "${CMAKE_CURRENT_LIST_DIR}/output_metadata.c"
 )
 target_compile_features(mali_worker PRIVATE c_std_11)
 target_compile_options(mali_worker PRIVATE -Wall -Wextra -Werror)

@@ -61,12 +61,19 @@ def main():
         "ZIG_LOCAL_CACHE_DIR": str(ROOT / "build/pjrt-deps/zig-local-cache"),
     }
     compiler_flags = ["-O0", "-g"] if args.debug else ["-O2"]
-    subprocess.run([
+    compiler = [
         args.zig, "cc", "-target", "aarch64-linux-gnu.2.28", "-shared", "-fPIC",
         "-std=c11", *compiler_flags, "-pthread", "-fvisibility=hidden", "-Wall", "-Wextra", "-Werror",
-        "-I", str(header.parent), *(str(SOURCE / file) for file in
-                                    ("plugin.c", "buffer.c", "executable.c")),
+        "-I", str(header.parent),
+    ]
+    subprocess.run([
+        *compiler, *(str(SOURCE / file) for file in
+                     ("plugin.c", "buffer.c", "executable.c", "compile_options.c")),
         "-o", str(package / "libpjrt_mali.so"),
+    ], check=True, cwd=ROOT, env=zig_env)
+    subprocess.run([
+        *(flag for flag in compiler if flag not in ("-shared", "-fPIC")),
+        str(SOURCE / "abi_smoke.c"), "-ldl", "-o", str(output / "abi_smoke"),
     ], check=True, cwd=ROOT, env=zig_env)
 
     android_build = ROOT / ("build/pjrt-iree-debug" if args.debug else "build/iree-3.11-android")

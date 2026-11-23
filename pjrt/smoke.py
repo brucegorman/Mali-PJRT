@@ -9,6 +9,7 @@ import uuid
 
 def check_device(missing_worker):
     import jax
+    import jax.numpy as jnp
     import numpy as np
     from training_fixture import train_eight_steps
 
@@ -73,6 +74,50 @@ def check_device(missing_worker):
     np.testing.assert_array_equal(np.asarray(second), np.array([3, 6], dtype=np.float32))
     print("PASS: JAX JIT returned two independent Mali outputs", flush=True)
 
+    matrix = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+    matrix_operand = np.arange(8, dtype=np.float32).reshape(4, 2)
+    matrix_result = jax.jit(jnp.matmul)(
+        jax.device_put(matrix, device), jax.device_put(matrix_operand, device)
+    )
+    np.testing.assert_array_equal(np.asarray(matrix_result), matrix @ matrix_operand, strict=True)
+
+    data = np.arange(24, dtype=np.int32).reshape(2, 3, 4) - 10
+    reduce = jax.jit(lambda value: jnp.sum(value.transpose(2, 0, 1)[1:4], axis=-1))
+    np.testing.assert_array_equal(
+        np.asarray(reduce(jax.device_put(data, device))),
+        data.transpose(2, 0, 1)[1:4].sum(axis=-1, dtype=np.int32),
+        strict=True,
+    )
+    for values, operation, expected in (
+        (np.array([0, 1, 0x80000000], dtype=np.uint32), jnp.bitwise_not,
+         np.array([0xffffffff, 0xfffffffe, 0x7fffffff], dtype=np.uint32)),
+        (np.array([True, False, True]), jnp.logical_not, np.array([False, True, False])),
+        (np.array([[0.5, 1.25]], dtype=np.float16), lambda value: value + value,
+         np.array([[1, 2.5]], dtype=np.float16)),
+        (np.array([-0.5, 1.25, 2.5], dtype=np.float16), lambda value: value + value,
+         np.array([-1, 2.5, 5], dtype=np.float16)),
+        (np.array(2.0, dtype=np.float32), lambda value: value * value,
+         np.array(4, dtype=np.float32)),
+        (np.empty((0, 3), dtype=np.float32), lambda value: value + value,
+         np.empty((0, 3), dtype=np.float32)),
+    ):
+        result = jax.jit(operation)(jax.device_put(values, device))
+        if result.device != device:
+            raise RuntimeError("JIT compatibility check returned an array on the wrong device")
+        np.testing.assert_array_equal(np.asarray(result), expected, strict=True)
+    print("PASS: batched matmul, transpose/slice/reduce, uint32, bool, float16, scalar, and empty JIT",
+          flush=True)
+
+    try:
+        jax.jit(lambda value: value + 3,
+                compiler_options={"xla_backend_optimization_level": 1})(x)
+    except RuntimeError as error:
+        if "Mali does not support XLA compiler option overrides" not in str(error):
+            raise
+    else:
+        raise RuntimeError("Mali accepted an unsupported compiler override")
+    print("PASS: unsupported JAX compiler override rejected", flush=True)
+
     initial = np.array([1, 2], dtype=np.float32)
     target = np.array([3, 7], dtype=np.float32)
     weights = jax.device_put(initial, device)
@@ -95,7 +140,9 @@ def check_device(missing_worker):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--missing-worker", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--missing-worker", action="store_true")
+    mode.add_argument("--abi", action="store_true", help="Check compile options and output metadata via C")
     parser.add_argument("--client", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.client:
@@ -116,10 +163,16 @@ def main():
             raise TimeoutError("Mali worker did not become ready")
         if worker.stdout.readline().strip() != "READY":
             raise RuntimeError("Mali worker stopped before becoming ready")
-        subprocess.run(
-            ["/system/bin/sh", str(package / "run_on_phone.sh"), "--client"],
-            check=True, timeout=90,
-        )
+        command = ["/system/bin/sh", str(package / "run_on_phone.sh"), "--client"]
+        if args.abi:
+            probe = package / "abi_smoke"
+            probe.chmod(0o700)
+            command = [
+                os.environ["MALI_GLIBC_LOADER"], "--library-path",
+                os.environ["MALI_GLIBC_LIBRARIES"], str(probe),
+                str(package / "jax_plugins/mali/libpjrt_mali.so"),
+            ]
+        subprocess.run(command, check=True, timeout=90)
         if worker.wait(timeout=5) != 0:
             raise RuntimeError("Mali worker did not shut down cleanly")
     finally:

@@ -28,6 +28,8 @@ struct PJRT_Client {
     PJRT_Device *devices[1];
     PJRT_Memory memory;
     PJRT_Memory *memories[1];
+    unsigned char *default_debug_options;
+    size_t default_debug_options_size;
 };
 
 struct PJRT_Buffer {
@@ -49,5 +51,8 @@ void release_handle(PJRT_Client *client, uint64_t handle);
 PJRT_Event *buffer_ready(void);
 void register_buffer_api(PJRT_Api *api);
 void register_executable_api(PJRT_Api *api);
+PJRT_Error *read_compile_defaults(PJRT_Client *client, const PJRT_NamedValue *options,
+                                  size_t count);
+PJRT_Error *validate_compile_options(const PJRT_Client *client, const char *bytes, size_t size);
 
 #endif

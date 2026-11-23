@@ -103,6 +103,13 @@ static PJRT_Error *client_create(PJRT_Client_Create_Args *args) {
         free(client);
         return make_error(PJRT_Error_Code_INTERNAL, "Could not initialize the worker lock");
     }
+    PJRT_Error *error = read_compile_defaults(client, args->create_options, args->num_options);
+    if (error != NULL) {
+        pthread_mutex_destroy(&client->worker_lock);
+        close(worker);
+        free(client);
+        return error;
+    }
     client->worker = worker;
     uint32_t version = info.api_version;
     snprintf(client->platform_version, sizeof(client->platform_version), "Vulkan %u.%u.%u",
@@ -134,6 +141,7 @@ static PJRT_Error *client_destroy(PJRT_Client_Destroy_Args *args) {
         close(args->client->worker);
     }
     pthread_mutex_destroy(&args->client->worker_lock);
+    free(args->client->default_debug_options);
     free(args->client);
     return NULL;
 }

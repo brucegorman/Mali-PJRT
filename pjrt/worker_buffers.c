@@ -3,6 +3,7 @@
 
 #include "iree/io/file_contents.h"
 #include "iree/vm/bytecode/module.h"
+#include "output_metadata.h"
 #include "pjrt_c_api.h"
 #include "protocol.h"
 #include "worker_buffers.h"
@@ -209,7 +210,16 @@ static enum mali_status load_module(struct worker *worker, const char *path, uin
         return result == MALI_OK ? MALI_INVALID : result;
     }
     executable->handle = worker->next_handle++;
-    executable->info = (struct mali_executable_info){(uint32_t)inputs, (uint32_t)outputs};
+    executable->info.inputs = (uint32_t)inputs;
+    executable->info.outputs = (uint32_t)outputs;
+    iree_string_view_t declaration = iree_vm_function_lookup_attr_by_name(
+        &executable->function, IREE_SV("iree.abi.declaration"));
+    if (!parse_output_metadata(declaration, &executable->info)) {
+        fputs("Unsupported IREE output signature for Mali\n", stderr);
+        iree_runtime_session_release(executable->session);
+        free(executable);
+        return MALI_UNSUPPORTED_SIGNATURE;
+    }
     executable->next = worker->executables;
     worker->executables = executable;
     *handle = executable->handle;
@@ -243,17 +253,25 @@ static enum mali_status execute_module(struct worker *worker, struct executable 
             break;
         }
         struct mali_result *result = &results[produced];
-        result->tensor.rank = iree_hal_buffer_view_shape_rank(view);
-        result->tensor.type = pjrt_type(iree_hal_buffer_view_element_type(view));
+        const struct mali_tensor *expected = &executable->info.output_tensors[produced];
+        result->tensor = *expected;
+        iree_hal_element_type_t actual_type = iree_hal_buffer_view_element_type(view);
+        iree_hal_element_type_t expected_type = element_types[expected->type];
+        bool type_matches = pjrt_type(actual_type) == expected->type ||
+            (iree_hal_element_numerical_type(actual_type) == IREE_HAL_NUMERICAL_TYPE_INTEGER &&
+             (iree_hal_element_numerical_type(expected_type) == IREE_HAL_NUMERICAL_TYPE_INTEGER_SIGNED ||
+              iree_hal_element_numerical_type(expected_type) == IREE_HAL_NUMERICAL_TYPE_INTEGER_UNSIGNED) &&
+             iree_hal_element_bit_count(actual_type) == iree_hal_element_bit_count(expected_type));
+        bool shape_matches = iree_hal_buffer_view_shape_rank(view) == expected->rank;
+        const iree_hal_dim_t *dims = iree_hal_buffer_view_shape_dims(view);
+        for (uint32_t i = 0; shape_matches && i < expected->rank; ++i) {
+            shape_matches = dims[i] == (iree_hal_dim_t)expected->dims[i];
+        }
         result->tensor.size = iree_hal_buffer_view_byte_length(view);
-        if (result->tensor.rank > MALI_MAX_RANK || result->tensor.type == PJRT_Buffer_Type_INVALID ||
+        if (!type_matches || !shape_matches ||
             iree_hal_buffer_view_encoding_type(view) != IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR) {
-            status = iree_make_status(IREE_STATUS_UNIMPLEMENTED, "Unsupported Mali output tensor");
+            status = iree_make_status(IREE_STATUS_INTERNAL, "Mali output differs from its compiled signature");
         } else {
-            const iree_hal_dim_t *dims = iree_hal_buffer_view_shape_dims(view);
-            for (uint32_t i = 0; i < result->tensor.rank; ++i) {
-                result->tensor.dims[i] = (int64_t)dims[i];
-            }
             result->handle = retain_view(worker, view);
             if (result->handle != 0) {
                 ++produced;

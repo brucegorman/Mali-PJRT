@@ -14,11 +14,15 @@
 extern char **environ;
 
 struct PJRT_Executable {
-    struct mali_executable_info info;
+    uint32_t inputs;
+    uint32_t outputs;
     int64_t generated_size;
     char fingerprint[17];
     const char *memory_kinds[MALI_MAX_OUTPUTS];
     size_t memory_kind_sizes[MALI_MAX_OUTPUTS];
+    PJRT_Buffer_Type output_types[MALI_MAX_OUTPUTS];
+    size_t output_ranks[MALI_MAX_OUTPUTS];
+    int64_t output_dims[MALI_MAX_OUTPUTS * MALI_MAX_RANK];
 };
 
 struct PJRT_LoadedExecutable {
@@ -42,7 +46,8 @@ static bool write_program(int fd, const char *data, size_t size) {
     return true;
 }
 
-static PJRT_Error *compile_module(const PJRT_Program *program, char *output, size_t output_capacity,
+static PJRT_Error *compile_module(const PJRT_Program *program, const char *target,
+                                  char *output, size_t output_capacity,
                                   int64_t *generated_size) {
     const char *loader = getenv("MALI_GLIBC_LOADER");
     const char *libraries = getenv("MALI_GLIBC_LIBRARIES");
@@ -71,7 +76,8 @@ static PJRT_Error *compile_module(const PJRT_Program *program, char *output, siz
     } else {
         char *argv[] = {
             (char *)loader, "--library-path", (char *)libraries, (char *)compiler, input,
-            "--iree-input-type=stablehlo", "--iree-hal-target-device=vulkan", "-o", output, NULL,
+            "--iree-input-type=stablehlo", "--iree-hal-target-device=vulkan", "-o", output,
+            (char *)target, NULL,
         };
         pid_t pid;
         if (posix_spawn(&pid, loader, NULL, NULL, argv, environ) != 0) {
@@ -114,22 +120,31 @@ static PJRT_Error *client_compile(PJRT_Client_Compile_Args *args) {
         memcmp(args->program->format, "mlir", 4) != 0 || args->program->code_size == 0) {
         return make_error(PJRT_Error_Code_INVALID_ARGUMENT, "Mali requires a StableHLO MLIR program");
     }
+    PJRT_Error *error = validate_compile_options(
+        args->client, args->compile_options, args->compile_options_size);
+    if (error != NULL) {
+        return error;
+    }
     PJRT_LoadedExecutable *loaded = calloc(1, sizeof(*loaded));
     if (loaded == NULL) {
         return make_error(PJRT_Error_Code_RESOURCE_EXHAUSTED, "Could not allocate Mali executable");
     }
     char path[4096];
-    PJRT_Error *error = compile_module(args->program, path, sizeof(path),
-                                      &loaded->executable.generated_size);
+    const char *name = args->client->device.description.info.name;
+    const char *target = strncmp(name, "Mali-G57", sizeof("Mali-G57") - 1) == 0
+        ? "--iree-vulkan-target=mali-g57" : NULL;
+    error = compile_module(args->program, target, path, sizeof(path),
+                           &loaded->executable.generated_size);
     if (error != NULL) {
         free(loaded);
         return error;
     }
     struct mali_request request = {.operation = MALI_LOAD};
     struct mali_reply reply;
+    struct mali_executable_info info;
     pthread_mutex_lock(&args->client->worker_lock);
     int status = exchange(args->client, &request, path, strlen(path) + 1,
-                          &loaded->executable.info, sizeof(loaded->executable.info), &reply);
+                          &info, sizeof(info), &reply);
     pthread_mutex_unlock(&args->client->worker_lock);
     unlink(path);
     if (status != MALI_OK) {
@@ -138,13 +153,23 @@ static PJRT_Error *client_compile(PJRT_Client_Compile_Args *args) {
     }
     loaded->client = args->client;
     loaded->handle = reply.handle;
-    for (uint32_t i = 0; i < loaded->executable.info.outputs; ++i) {
+    loaded->executable.inputs = info.inputs;
+    loaded->executable.outputs = info.outputs;
+    size_t dim_offset = 0;
+    for (uint32_t i = 0; i < info.outputs; ++i) {
+        const struct mali_tensor *tensor = &info.output_tensors[i];
         loaded->executable.memory_kinds[i] = "device";
         loaded->executable.memory_kind_sizes[i] = sizeof("device") - 1;
+        loaded->executable.output_types[i] = tensor->type;
+        loaded->executable.output_ranks[i] = tensor->rank;
+        memcpy(loaded->executable.output_dims + dim_offset, tensor->dims,
+               tensor->rank * sizeof(tensor->dims[0]));
+        dim_offset += tensor->rank;
     }
     uint64_t hash = program_fingerprint(UINT64_C(14695981039346656037),
                                         args->program->code, args->program->code_size);
     hash = program_fingerprint(hash, args->compile_options, args->compile_options_size);
+    hash = program_fingerprint(hash, name, strlen(name));
     snprintf(loaded->executable.fingerprint, sizeof(loaded->executable.fingerprint),
              "%016" PRIx64, hash);
     args->executable = loaded;
@@ -154,8 +179,8 @@ static PJRT_Error *client_compile(PJRT_Client_Compile_Args *args) {
 static PJRT_Error *loaded_execute(PJRT_LoadedExecutable_Execute_Args *args) {
     PJRT_LoadedExecutable *loaded = args->executable;
     PJRT_Client *client = loaded->client;
-    size_t outputs = loaded->executable.info.outputs;
-    if (args->num_devices != 1 || args->num_args != loaded->executable.info.inputs ||
+    size_t outputs = loaded->executable.outputs;
+    if (args->num_devices != 1 || args->num_args != loaded->executable.inputs ||
         (args->execute_device != NULL && args->execute_device != &client->device) ||
         (args->options != NULL && (args->options->num_send_ops || args->options->num_recv_ops))) {
         return make_error(PJRT_Error_Code_INVALID_ARGUMENT, "Unsupported Mali execution configuration");
@@ -274,14 +299,27 @@ static PJRT_Error *executable_partitions(PJRT_Executable_NumPartitions_Args *arg
 }
 
 static PJRT_Error *executable_outputs(PJRT_Executable_NumOutputs_Args *args) {
-    args->num_outputs = args->executable->info.outputs;
+    args->num_outputs = args->executable->outputs;
     return NULL;
 }
 
 static PJRT_Error *executable_memory_kinds(PJRT_Executable_OutputMemoryKinds_Args *args) {
-    args->num_outputs = args->executable->info.outputs;
+    args->num_outputs = args->executable->outputs;
     args->memory_kinds = args->executable->memory_kinds;
     args->memory_kind_sizes = args->executable->memory_kind_sizes;
+    return NULL;
+}
+
+static PJRT_Error *executable_output_types(PJRT_Executable_OutputElementTypes_Args *args) {
+    args->output_types = args->executable->output_types;
+    args->num_output_types = args->executable->outputs;
+    return NULL;
+}
+
+static PJRT_Error *executable_output_dimensions(PJRT_Executable_OutputDimensions_Args *args) {
+    args->num_outputs = args->executable->outputs;
+    args->dim_sizes = args->executable->output_ranks;
+    args->dims = args->executable->output_dims;
     return NULL;
 }
 
@@ -335,6 +373,8 @@ void register_executable_api(PJRT_Api *api) {
     api->PJRT_Executable_NumPartitions = executable_partitions;
     api->PJRT_Executable_NumOutputs = executable_outputs;
     api->PJRT_Executable_OutputMemoryKinds = executable_memory_kinds;
+    api->PJRT_Executable_OutputElementTypes = executable_output_types;
+    api->PJRT_Executable_OutputDimensions = executable_output_dimensions;
     api->PJRT_Executable_SizeOfGeneratedCodeInBytes = executable_size;
     api->PJRT_Executable_Fingerprint = executable_fingerprint;
     api->PJRT_Executable_Serialize = executable_serialize;
