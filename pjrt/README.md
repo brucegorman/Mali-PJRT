@@ -1,9 +1,12 @@
-# Mali PJRT scaffold
+# Mali PJRT backend
 
 JAX 0.6.1 loads a Linux arm64 PJRT library and connects to an Android arm64
 worker over an abstract Unix socket. The worker opens a Vulkan logical device
 and compute queue. JAX exposes that device through `jax.devices("mali")`.
 Use `jax.device_put(x, mali)` to upload and `np.asarray(x_on_mali)` to read back.
+Calling a JAX JIT function compiles StableHLO with IREE on the phone. The
+worker loads the resulting VMFB and runs it on Vulkan. It returns buffer
+handles so a caller can pass the results into another JIT call.
 
 | File | Entry point |
 |---|---|
@@ -11,19 +14,22 @@ Use `jax.device_put(x, mali)` to upload and `np.asarray(x_on_mali)` to read back
 | [PJRT C plugin](plugin.c) | `GetPjrtApi()` exposes the API table. `client_create()` reads and owns the device description. |
 | [Android worker](worker.c) | `open_vulkan()` opens an Arm Vulkan 1.1 device. `serve_client()` holds it until the PJRT client disconnects. |
 | [PJRT buffer callbacks](buffer.c) | Transfers bytes in chunks and keeps the worker handle, shape, and dtype. |
-| [Worker buffers](worker_buffers.c) | Allocates, maps, and releases Vulkan buffers. A connection owns its buffers. |
-| [Protocol](protocol.h) | The versioned hello, device metadata packet, and buffer requests. |
+| [PJRT executable callbacks](executable.c) | Invokes the arm64 IREE compiler, loads an executable, and dispatches it by handle. |
+| [Worker buffers and execution](worker_buffers.c) | Holds the Vulkan HAL buffer views and the IREE sessions that run compiled modules. |
+| [Protocol](protocol.h) | Device metadata, tensor descriptions, transfers, and executable requests. |
 
-The Y36m reports a single `Mali-G57 MC2` with Vulkan 1.1.177. Transfers are
-synchronous and use host-visible coherent Vulkan memory. The worker prefers
-device-local memory with both properties. The backend supports dense row-major
-device buffers, strided host uploads, and conventional byte-aligned types
-such as float32, int32 and bool. JIT compilation and GPU dispatch through PJRT
-are the remaining operations.
+The Y36m reports a single `Mali-G57 MC2` with Vulkan 1.1.177. The backend
+supports one device, dense row-major buffers, strided host uploads, and
+conventional byte-aligned buffer types such as float32, int32, and bool.
+IREE manages Vulkan allocation and transfer, and the PJRT callbacks return
+completed events for synchronous operations. Executable serialization,
+host callbacks, and distributed execution are outside this implementation.
 
 ## Build and check
 
-From the project directory, with Python, CMake, Ninja, and Zig available:
+With Python, CMake, Ninja, and Zig available, prepare the IREE v3.11 source
+and host generators using the [root build instructions](../README.md#build-the-android-runtime).
+Then run from the project directory:
 
 ```powershell
 python pjrt/build.py --zig build/pjrt-deps/zig-x86_64-windows-0.15.2/zig.exe
@@ -33,21 +39,24 @@ adb shell -T sh "$deviceDir/pjrt/run_on_phone.sh"
 adb shell -T sh "$deviceDir/pjrt/run_on_phone.sh" --missing-worker
 ```
 
-Pass `--ndk` to override the shared Android NDK location. If Zig is on PATH,
-omit `--zig`. Use the device directory set up in the
+Pass `--ndk`, `--iree`, or `--host-bin` to override the existing Android
+NDK, IREE source, or host generator location. If Zig is on PATH, omit `--zig`.
+Use the device directory set up in the
 [phone training instructions](../README.md#compile-and-train-on-the-phone).
 The build fetches and verifies the PJRT header from the XLA revision used by
-JAX 0.6.1. The plugin targets glibc 2.28, and the worker targets Android API 24.
+JAX 0.6.1. The plugin targets glibc 2.28, and the IREE worker targets Android API 29.
 If LLDB has the existing worker open on Windows, use `--debug --output
-build/pjrt-buffers-debug` and use `pjrt-buffers-debug` as the package directory
+build/pjrt-jit-debug` and use `pjrt-jit-debug` as the package directory
 in the debug commands below.
 
 The smoke check verifies device metadata, upload, readback and deletion for
 a multi-packet float32 matrix, a strided int32 view, a scalar, an empty array,
 and bool values. It mutates the host input after upload to verify independent
-storage. It also checks that JIT returns a PJRT error and that the worker shuts
-down after the JAX process exits. The missing-worker check exercises backend
-initialization failure.
+storage. It verifies a JIT addition, a function with two outputs, and two
+eight-step training calls whose intermediate weights stay on Mali. The final
+weights match the analytical result and the loss falls from 14.500000 to
+0.202128. The worker exits when the JAX process closes its connection. The
+missing-worker check exercises backend initialization failure.
 
 ## Android 调试入门
 

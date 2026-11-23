@@ -9,9 +9,8 @@
 
 struct mali_vulkan {
     VkInstance instance;
-    VkDevice device;
-    VkQueue queue;
-    VkPhysicalDeviceMemoryProperties memory;
+    iree_runtime_instance_t *runtime;
+    iree_hal_device_t *device;
     struct mali_device_info info;
 };
 
@@ -76,27 +75,6 @@ static bool open_vulkan(struct mali_vulkan *vulkan) {
             !find_compute_queue(devices[index], &family)) {
             continue;
         }
-        const float priority = 1.0f;
-        const VkDeviceQueueCreateInfo queue_info = {
-            .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-            .queueFamilyIndex = family,
-            .queueCount = 1,
-            .pQueuePriorities = &priority,
-        };
-        const VkDeviceCreateInfo device_info = {
-            .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-            .queueCreateInfoCount = 1,
-            .pQueueCreateInfos = &queue_info,
-        };
-        result = vkCreateDevice(devices[index], &device_info, NULL, &vulkan->device);
-        if (result != VK_SUCCESS) {
-            fprintf(stderr, "vkCreateDevice failed for %s: %d\n", properties.deviceName,
-                    (int)result);
-            vulkan->device = VK_NULL_HANDLE;
-            continue;
-        }
-        vkGetDeviceQueue(vulkan->device, family, 0, &vulkan->queue);
-        vkGetPhysicalDeviceMemoryProperties(devices[index], &vulkan->memory);
         vulkan->info = (struct mali_device_info){
             .protocol_version = MALI_PJRT_PROTOCOL_VERSION,
             .vendor_id = properties.vendorID,
@@ -106,6 +84,48 @@ static bool open_vulkan(struct mali_vulkan *vulkan) {
         };
         snprintf(vulkan->info.name, sizeof(vulkan->info.name), "%s", properties.deviceName);
         free(devices);
+        iree_runtime_instance_options_t options;
+        iree_runtime_instance_options_initialize(&options);
+        iree_runtime_instance_options_use_all_available_drivers(&options);
+        iree_status_t status = iree_runtime_instance_create(
+            &options, iree_allocator_system(), &vulkan->runtime);
+        if (iree_status_is_ok(status)) {
+            iree_hal_driver_t *driver = NULL;
+            iree_hal_driver_registry_t *registry =
+                iree_runtime_instance_driver_registry(vulkan->runtime);
+            status = iree_hal_driver_registry_try_create(
+                registry, IREE_SV("vulkan"), iree_allocator_system(), &driver);
+            if (iree_status_is_ok(status)) {
+                iree_host_size_t device_count = 0;
+                iree_hal_device_info_t *iree_devices = NULL;
+                status = iree_hal_driver_query_available_devices(
+                    driver, iree_allocator_system(), &device_count, &iree_devices);
+                if (iree_status_is_ok(status)) {
+                    bool found = false;
+                    for (iree_host_size_t i = 0; i < device_count; ++i) {
+                        if (iree_string_view_equal(iree_devices[i].name,
+                                                   iree_make_cstring_view(vulkan->info.name))) {
+                            status = iree_hal_driver_create_device_by_id(
+                                driver, iree_devices[i].device_id, 0, NULL,
+                                iree_allocator_system(), &vulkan->device);
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        status = iree_make_status(IREE_STATUS_NOT_FOUND,
+                                                  "IREE did not find %s", vulkan->info.name);
+                    }
+                }
+                iree_allocator_free(iree_allocator_system(), iree_devices);
+                iree_hal_driver_release(driver);
+            }
+        }
+        if (!iree_status_is_ok(status)) {
+            iree_status_fprint(stderr, status);
+            iree_status_free(status);
+            return false;
+        }
         return true;
     }
     free(devices);
@@ -114,9 +134,8 @@ static bool open_vulkan(struct mali_vulkan *vulkan) {
 }
 
 static void close_vulkan(struct mali_vulkan *vulkan) {
-    if (vulkan->device != VK_NULL_HANDLE) {
-        vkDestroyDevice(vulkan->device, NULL);
-    }
+    iree_hal_device_release(vulkan->device);
+    iree_runtime_instance_release(vulkan->runtime);
     if (vulkan->instance != VK_NULL_HANDLE) {
         vkDestroyInstance(vulkan->instance, NULL);
     }
@@ -135,7 +154,7 @@ static int serve_client(int listener, const struct mali_vulkan *vulkan) {
     if (length == sizeof(MALI_PJRT_HELLO) - 1 &&
         memcmp(request, MALI_PJRT_HELLO, (size_t)length) == 0) {
         if (send_packet(client, &vulkan->info, sizeof(vulkan->info), NULL, 0)) {
-            result = serve_buffers(client, vulkan->device, &vulkan->memory);
+            result = serve_buffers(client, vulkan->runtime, vulkan->device);
         } else {
             perror("send");
         }

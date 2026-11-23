@@ -37,12 +37,18 @@ def main():
     parser.add_argument("--output", type=Path, help="Use a separate package directory")
     parser.add_argument("--ndk", type=Path,
                         default=ROOT.parent / ".gpu-android-tools" / "android-ndk-r30")
+    parser.add_argument("--iree", type=Path, default=ROOT / "build/iree-3.11-src",
+                        help="Prepared IREE v3.11 source, with runtime submodules")
+    parser.add_argument("--host-bin", type=Path, default=ROOT / "build/host-bin",
+                        help="Directory containing the IREE host generators")
     args = parser.parse_args()
     if not args.zig:
         parser.error("Set --zig or put Zig on PATH")
     toolchain = args.ndk.resolve() / "build/cmake/android.toolchain.cmake"
     if not toolchain.is_file():
         parser.error(f"Android NDK toolchain not found: {toolchain}")
+    if not (args.iree / "CMakeLists.txt").is_file() or not args.host_bin.is_dir():
+        parser.error("Prepare IREE source and host tools using the root README first")
 
     header = pjrt_header(ROOT / "build/pjrt-deps")
     output = (args.output.resolve() if args.output is not None else
@@ -58,24 +64,32 @@ def main():
     subprocess.run([
         args.zig, "cc", "-target", "aarch64-linux-gnu.2.28", "-shared", "-fPIC",
         "-std=c11", *compiler_flags, "-pthread", "-fvisibility=hidden", "-Wall", "-Wextra", "-Werror",
-        "-I", str(header.parent), str(SOURCE / "plugin.c"), str(SOURCE / "buffer.c"),
+        "-I", str(header.parent), *(str(SOURCE / file) for file in
+                                    ("plugin.c", "buffer.c", "executable.c")),
         "-o", str(package / "libpjrt_mali.so"),
     ], check=True, cwd=ROOT, env=zig_env)
 
-    android_build = ROOT / ("build/pjrt-android-debug" if args.debug else "build/pjrt-android")
+    android_build = ROOT / ("build/pjrt-iree-debug" if args.debug else "build/iree-3.11-android")
     build_type = "Debug" if args.debug else "Release"
+    worker_env = {**os.environ, "PATH": str(args.host_bin.resolve()) + os.pathsep + os.environ["PATH"]}
     subprocess.run([
-        "cmake", "-S", str(ROOT), "-B", str(android_build), "-G", "Ninja",
+        "cmake", "-S", str(args.iree.resolve()), "-B", str(android_build), "-G", "Ninja",
         f"-DCMAKE_TOOLCHAIN_FILE={toolchain.as_posix()}",
-        "-DANDROID_ABI=arm64-v8a", "-DANDROID_PLATFORM=android-24",
+        "-DANDROID_ABI=arm64-v8a", "-DANDROID_PLATFORM=android-29",
         f"-DCMAKE_BUILD_TYPE={build_type}",
-    ], check=True)
-    subprocess.run(["cmake", "--build", str(android_build), "--target", "mali_worker"],
-                   check=True)
-    shutil.copy2(android_build / "mali_worker", output)
+        "-DIREE_BUILD_COMPILER=OFF", "-DIREE_BUILD_TESTS=OFF", "-DIREE_BUILD_SAMPLES=OFF",
+        "-DIREE_BUILD_BENCHMARKS=OFF", "-DIREE_HAL_DRIVER_DEFAULTS=OFF",
+        "-DIREE_HAL_DRIVER_VULKAN=ON", "-DIREE_ERROR_ON_MISSING_SUBMODULES=OFF",
+        f"-DIREE_CMAKE_PLUGIN_PATHS={SOURCE.as_posix()}",
+        f"-DMALI_PJRT_HEADER_DIR={header.parent.as_posix()}",
+    ], check=True, env=worker_env)
+    subprocess.run(["cmake", "--build", str(android_build), "--target", "mali_worker", "-j", "8"],
+                   check=True, env=worker_env)
+    shutil.copy2(android_build / "tools/mali_worker", output)
     shutil.copy2(SOURCE / "jax_plugins/mali/__init__.py", package)
     for name in ("run_on_phone.sh", "smoke.py"):
         shutil.copy2(SOURCE / name, output)
+    shutil.copy2(ROOT / "smoke.py", output / "training_fixture.py")
     print(output)
 
 

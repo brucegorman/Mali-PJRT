@@ -3,15 +3,6 @@
 
 #include "plugin_internal.h"
 
-struct PJRT_Buffer {
-    PJRT_Client *client;
-    uint64_t handle;
-    size_t size;
-    size_t rank;
-    PJRT_Buffer_Type type;
-    int64_t dims[];
-};
-
 struct PJRT_Event {
     bool deleted_buffer;
 };
@@ -19,6 +10,10 @@ struct PJRT_Event {
 // Transfers are synchronous, so all events can share immutable terminal states.
 static PJRT_Event ready_event;
 static PJRT_Event deleted_event = {.deleted_buffer = true};
+
+PJRT_Event *buffer_ready(void) {
+    return &ready_event;
+}
 
 static PJRT_Error *event_status(PJRT_Event *event) {
     return event->deleted_buffer
@@ -51,17 +46,16 @@ static PJRT_Error *event_on_ready(PJRT_Event_OnReady_Args *args) {
 
 // The caller holds worker_lock through the whole transfer. A failed transport
 // closes the connection so the worker can release all remaining allocations.
-static int exchange(PJRT_Client *client, const struct mali_request *request,
-                    const void *input, void *output, struct mali_reply *reply) {
+int exchange(PJRT_Client *client, const struct mali_request *request,
+             const void *input, size_t input_size, void *output, size_t output_size,
+             struct mali_reply *reply) {
     if (client->worker < 0) {
         return -1;
     }
-    size_t write_size = request->operation == MALI_WRITE ? (size_t)request->length : 0;
-    size_t read_size = request->operation == MALI_READ ? (size_t)request->length : 0;
-    if (send_packet(client->worker, request, sizeof(*request), input, write_size)) {
-        ssize_t count = receive_packet(client->worker, reply, sizeof(*reply), output, read_size);
+    if (send_packet(client->worker, request, sizeof(*request), input, input_size)) {
+        ssize_t count = receive_packet(client->worker, reply, sizeof(*reply), output, output_size);
         if (count >= (ssize_t)sizeof(*reply) &&
-            count == (ssize_t)(sizeof(*reply) + (reply->status == MALI_OK ? read_size : 0))) {
+            count == (ssize_t)(sizeof(*reply) + (reply->status == MALI_OK ? output_size : 0))) {
             return (int)reply->status;
         }
     }
@@ -70,7 +64,7 @@ static int exchange(PJRT_Client *client, const struct mali_request *request,
     return -1;
 }
 
-static PJRT_Error *transfer_error(int status) {
+PJRT_Error *transfer_error(int status) {
     switch (status) {
         case MALI_OK: return NULL;
         case MALI_OUT_OF_MEMORY:
@@ -78,7 +72,9 @@ static PJRT_Error *transfer_error(int status) {
         case MALI_UNSUPPORTED_MEMORY:
             return make_error(PJRT_Error_Code_UNIMPLEMENTED, "No coherent Vulkan memory for this buffer");
         case MALI_NOT_FOUND:
-            return make_error(PJRT_Error_Code_FAILED_PRECONDITION, "Vulkan buffer is gone");
+            return make_error(PJRT_Error_Code_FAILED_PRECONDITION, "Mali handle is gone");
+        case MALI_RUNTIME_ERROR:
+            return make_error(PJRT_Error_Code_INTERNAL, "IREE Vulkan runtime failed (see worker stderr)");
         case -1:
             return make_error(PJRT_Error_Code_UNAVAILABLE, "Lost connection to Mali worker");
         default:
@@ -193,10 +189,10 @@ static void pack_host_array(const PJRT_Client_BufferFromHostBuffer_Args *args,
     }
 }
 
-static void release_handle(PJRT_Client *client, uint64_t handle) {
+void release_handle(PJRT_Client *client, uint64_t handle) {
     struct mali_request request = {.operation = MALI_RELEASE, .handle = handle};
     struct mali_reply reply;
-    exchange(client, &request, NULL, NULL, &reply);
+    exchange(client, &request, NULL, 0, NULL, 0, &reply);
 }
 
 static int transfer(PJRT_Buffer *buffer, enum mali_operation operation,
@@ -207,7 +203,8 @@ static int transfer(PJRT_Buffer *buffer, enum mali_operation operation,
         struct mali_request request = {
             .operation = operation, .handle = buffer->handle, .offset = offset, .length = chunk,
         };
-        int status = exchange(buffer->client, &request, input, output, &reply);
+        int status = exchange(buffer->client, &request, input, input ? chunk : 0,
+                              output, output ? chunk : 0, &reply);
         if (status != MALI_OK) {
             return status;
         }
@@ -223,13 +220,32 @@ static int transfer(PJRT_Buffer *buffer, enum mali_operation operation,
     return MALI_OK;
 }
 
+PJRT_Buffer *create_buffer(PJRT_Client *client, const struct mali_tensor *tensor, uint64_t handle) {
+    if (tensor->rank > MALI_MAX_RANK) {
+        return NULL;
+    }
+    PJRT_Buffer *buffer = calloc(1, sizeof(*buffer) + tensor->rank * 2 * sizeof(int64_t));
+    if (buffer != NULL) {
+        buffer->client = client;
+        buffer->handle = handle;
+        buffer->size = tensor->size;
+        buffer->rank = tensor->rank;
+        buffer->type = tensor->type;
+        for (size_t i = 0; i < buffer->rank; ++i) {
+            buffer->dims[i] = tensor->dims[i];
+            buffer->dims[buffer->rank + i] = (int64_t)(buffer->rank - 1 - i);
+        }
+    }
+    return buffer;
+}
+
 static PJRT_Error *client_buffer_from_host(PJRT_Client_BufferFromHostBuffer_Args *args) {
     args->buffer = NULL;
     args->done_with_host_buffer = NULL;
     if ((args->device != NULL && args->device != &args->client->device) ||
         (args->memory != NULL && args->memory != &args->client->memory) ||
         (args->num_dims != 0 && args->dims == NULL) ||
-        args->num_dims > (SIZE_MAX - sizeof(PJRT_Buffer)) / (2 * sizeof(int64_t))) {
+        args->num_dims > MALI_MAX_RANK) {
         return make_error(PJRT_Error_Code_INVALID_ARGUMENT, "Invalid Mali buffer destination or rank");
     }
     size_t item_size = element_size(args->type);
@@ -246,17 +262,13 @@ static PJRT_Error *client_buffer_from_host(PJRT_Client_BufferFromHostBuffer_Args
     if (size != 0 && !check_strides(args, item_size, &dense)) {
         return make_error(PJRT_Error_Code_INVALID_ARGUMENT, "Invalid Mali buffer strides");
     }
-    PJRT_Buffer *buffer = calloc(1, sizeof(*buffer) + args->num_dims * 2 * sizeof(int64_t));
+    struct mali_tensor tensor = {.size = size, .type = args->type, .rank = args->num_dims};
+    for (size_t i = 0; i < args->num_dims; ++i) {
+        tensor.dims[i] = args->dims[i];
+    }
+    PJRT_Buffer *buffer = create_buffer(args->client, &tensor, 0);
     if (buffer == NULL) {
         return make_error(PJRT_Error_Code_RESOURCE_EXHAUSTED, "Could not record Mali buffer");
-    }
-    buffer->client = args->client;
-    buffer->size = size;
-    buffer->rank = args->num_dims;
-    buffer->type = args->type;
-    for (size_t i = 0; i < buffer->rank; ++i) {
-        buffer->dims[i] = args->dims[i];
-        buffer->dims[buffer->rank + i] = (int64_t)(buffer->rank - 1 - i);
     }
     unsigned char *packed = NULL;
     if (!dense) {
@@ -271,7 +283,7 @@ static PJRT_Error *client_buffer_from_host(PJRT_Client_BufferFromHostBuffer_Args
     struct mali_request request = {.operation = MALI_ALLOCATE, .length = size};
     struct mali_reply reply;
     pthread_mutex_lock(&args->client->worker_lock);
-    int status = exchange(args->client, &request, NULL, NULL, &reply);
+    int status = exchange(args->client, &request, &tensor, sizeof(tensor), NULL, 0, &reply);
     if (status == MALI_OK) {
         buffer->handle = reply.handle;
         status = transfer(buffer, MALI_WRITE, 0, size, packed != NULL ? packed : args->data, NULL);

@@ -10,10 +10,12 @@
 #include <sys/un.h>
 #include <sys/uio.h>
 
-#define MALI_PJRT_HELLO "MALI-PJRT/3 HELLO"
-#define MALI_PJRT_PROTOCOL_VERSION 3
+#define MALI_PJRT_HELLO "MALI-PJRT/4 HELLO"
+#define MALI_PJRT_PROTOCOL_VERSION 4
 #define MALI_VULKAN_VENDOR_ID 0x13b5u
 #define MALI_TRANSFER_CHUNK (64 * 1024u)
+#define MALI_MAX_RANK 64
+#define MALI_MAX_OUTPUTS 32
 
 // Both peers use little-endian arm64. This packet contains no process-local pointers.
 struct mali_device_info {
@@ -32,6 +34,9 @@ enum mali_operation {
     MALI_WRITE,
     MALI_READ,
     MALI_RELEASE,
+    MALI_LOAD,
+    MALI_EXECUTE,
+    MALI_UNLOAD,
 };
 
 enum mali_status {
@@ -40,6 +45,24 @@ enum mali_status {
     MALI_NOT_FOUND,
     MALI_OUT_OF_MEMORY,
     MALI_UNSUPPORTED_MEMORY,
+    MALI_RUNTIME_ERROR,
+};
+
+struct mali_tensor {
+    uint64_t size;
+    uint32_t type;
+    uint32_t rank;
+    int64_t dims[MALI_MAX_RANK];
+};
+
+struct mali_result {
+    uint64_t handle;
+    struct mali_tensor tensor;
+};
+
+struct mali_executable_info {
+    uint32_t inputs;
+    uint32_t outputs;
 };
 
 struct mali_request {
@@ -58,6 +81,8 @@ struct mali_reply {
 
 _Static_assert(sizeof(struct mali_request) == 32 && sizeof(struct mali_reply) == 16,
                "Unexpected buffer packet layout");
+_Static_assert(sizeof(struct mali_tensor) == 528 && sizeof(struct mali_result) == 536,
+               "Unexpected tensor packet layout");
 
 static inline bool send_packet(int socket, const void *header, size_t header_size,
                                const void *data, size_t data_size) {

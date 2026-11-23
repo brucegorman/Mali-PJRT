@@ -98,9 +98,10 @@ socket to reach the Android process. On the Y36m, `jax.devices("mali")` returns
 the Mali-G57 MC2 opened by the worker. `jax.device_put()` and NumPy readback
 transfer arrays through Vulkan buffers owned by that worker.
 
-The JIT milestone is to run the `train_eight_steps` fixture through the
-`mali` backend. IREE's experimental
-`iree_vulkan` plugin provides examples of PJRT compilation, device buffers,
-and execution.
+The PJRT backend runs `jax.jit(train_eight_steps)` directly from Python on
+the phone. The plugin starts the on-device IREE compiler and the worker
+executes the result with its Vulkan device. The verification chains two
+calls before reading back the weights. IREE's experimental `iree_vulkan`
+plugin provides additional examples of PJRT integration.
 
 [IREE PJRT build guide](https://github.com/iree-org/iree/tree/v3.11.0/integrations/pjrt) · [JAX platform matrix](https://docs.jax.dev/en/latest/installation.html)

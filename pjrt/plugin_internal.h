@@ -30,7 +30,24 @@ struct PJRT_Client {
     PJRT_Memory *memories[1];
 };
 
+struct PJRT_Buffer {
+    PJRT_Client *client;
+    uint64_t handle;
+    size_t size;
+    size_t rank;
+    PJRT_Buffer_Type type;
+    int64_t dims[];
+};
+
 PJRT_Error *make_error(PJRT_Error_Code code, const char *message);
+int exchange(PJRT_Client *client, const struct mali_request *request,
+             const void *input, size_t input_size, void *output, size_t output_size,
+             struct mali_reply *reply);
+PJRT_Error *transfer_error(int status);
+PJRT_Buffer *create_buffer(PJRT_Client *client, const struct mali_tensor *tensor, uint64_t handle);
+void release_handle(PJRT_Client *client, uint64_t handle);
+PJRT_Event *buffer_ready(void);
 void register_buffer_api(PJRT_Api *api);
+void register_executable_api(PJRT_Api *api);
 
 #endif

@@ -1,4 +1,4 @@
-"""Verify Mali device enumeration and PJRT buffer round trips on Android."""
+"""Verify Mali PJRT device discovery, buffers, and JIT training on Android."""
 
 import argparse
 import os
@@ -10,6 +10,7 @@ import uuid
 def check_device(missing_worker):
     import jax
     import numpy as np
+    from training_fixture import train_eight_steps
 
     jax.config.update("jax_platforms", "mali")
     if missing_worker:
@@ -59,14 +60,37 @@ def check_device(missing_worker):
             raise RuntimeError("Mali buffer was not marked deleted")
     print("PASS: Mali upload, readback, and deletion for five input layouts", flush=True)
 
-    try:
-        jax.jit(lambda x: x + x).lower(jax.ShapeDtypeStruct((2,), np.float32)).compile()
-    except RuntimeError as error:
-        if "Mali PJRT compilation is unavailable" not in str(error):
-            raise
-        print("PASS: unavailable compilation returned a PJRT error", flush=True)
-    else:
-        raise RuntimeError("Compilation unexpectedly succeeded")
+    x = jax.device_put(np.array([1, 2], dtype=np.float32), device)
+    doubled = jax.jit(lambda values: values + values)(x)
+    if doubled.device != device:
+        raise RuntimeError("JIT addition did not produce a Mali array")
+    np.testing.assert_array_equal(np.asarray(doubled), np.array([2, 4], dtype=np.float32))
+    print("PASS: JAX JIT addition on Mali", flush=True)
+    first, second = jax.jit(lambda values: (values + 1, values * 3))(x)
+    if first.device != device or second.device != device:
+        raise RuntimeError("JIT returned a result on the wrong device")
+    np.testing.assert_array_equal(np.asarray(first), np.array([2, 3], dtype=np.float32))
+    np.testing.assert_array_equal(np.asarray(second), np.array([3, 6], dtype=np.float32))
+    print("PASS: JAX JIT returned two independent Mali outputs", flush=True)
+
+    initial = np.array([1, 2], dtype=np.float32)
+    target = np.array([3, 7], dtype=np.float32)
+    weights = jax.device_put(initial, device)
+    inputs = jax.device_put(np.eye(2, dtype=np.float32), device)
+    targets = jax.device_put(target, device)
+    train = jax.jit(train_eight_steps)
+    for _ in range(2):
+        weights = train(weights, inputs, targets)
+        if weights.device != device:
+            raise RuntimeError("JIT training did not return Mali weights")
+    final = np.asarray(weights)
+    expected = target + (initial - target) * (7 / 8) ** 16
+    np.testing.assert_allclose(final, expected, rtol=1e-6, atol=1e-6)
+    mse_before = np.mean((initial - target) ** 2)
+    mse_after = np.mean((final - target) ** 2)
+    print(f"PASS: two Mali JIT training calls, MSE {mse_before:.6f} -> {mse_after:.6f}",
+          flush=True)
+    print(f"weights={final.tolist()}", flush=True)
 
 
 def main():
@@ -94,7 +118,7 @@ def main():
             raise RuntimeError("Mali worker stopped before becoming ready")
         subprocess.run(
             ["/system/bin/sh", str(package / "run_on_phone.sh"), "--client"],
-            check=True, timeout=30,
+            check=True, timeout=90,
         )
         if worker.wait(timeout=5) != 0:
             raise RuntimeError("Mali worker did not shut down cleanly")

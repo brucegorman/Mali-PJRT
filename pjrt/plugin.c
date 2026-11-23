@@ -85,6 +85,13 @@ static PJRT_Error *client_create(PJRT_Client_Create_Args *args) {
         close(worker);
         return make_error(PJRT_Error_Code_UNAVAILABLE, "Could not handshake with Mali worker");
     }
+    // Compiled workloads may take longer than the startup handshake.
+    const struct timeval no_receive_timeout = {0};
+    if (setsockopt(worker, SOL_SOCKET, SO_RCVTIMEO,
+                   &no_receive_timeout, sizeof(no_receive_timeout)) != 0) {
+        close(worker);
+        return make_error(PJRT_Error_Code_INTERNAL, "Could not configure Mali worker execution");
+    }
 
     PJRT_Client *client = calloc(1, sizeof(*client));
     if (client == NULL) {
@@ -294,11 +301,6 @@ static PJRT_Error *client_default_device_assignment(PJRT_Client_DefaultDeviceAss
     return NULL;
 }
 
-static PJRT_Error *client_compile(PJRT_Client_Compile_Args *args) {
-    args->executable = NULL;
-    return make_error(PJRT_Error_Code_UNIMPLEMENTED, "Mali PJRT compilation is unavailable");
-}
-
 static PJRT_Api api = {
         .struct_size = PJRT_Api_STRUCT_SIZE,
         .pjrt_api_version = {
@@ -341,11 +343,11 @@ static PJRT_Api api = {
         .PJRT_Memory_ToString = memory_to_string,
         .PJRT_Memory_AddressableByDevices = memory_addressable_by_devices,
         .PJRT_Client_DefaultDeviceAssignment = client_default_device_assignment,
-        .PJRT_Client_Compile = client_compile,
 };
 
 static void initialize_api(void) {
     register_buffer_api(&api);
+    register_executable_api(&api);
 }
 
 __attribute__((visibility("default")))
