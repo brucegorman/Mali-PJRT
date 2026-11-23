@@ -89,3 +89,17 @@ cmake --build build/iree-3.11-android --target iree-run-module
 python verify_android.py --runner build/iree-3.11-android/tools/iree-run-module `
     --predict build/predict-v3.11.vmfb --train-step build/train_step-v3.11.vmfb
 ```
+
+## PJRT milestone
+
+The [PJRT backend](pjrt/README.md) connects the JAX plugin loader to an
+Android worker. It reuses the phone's glibc JAX environment and uses a Unix
+socket to reach the Android process. On the Y36m, `jax.devices("mali")` returns
+the Mali-G57 MC2 opened by the worker.
+
+The JIT milestone is to run the `train_eight_steps` fixture through the
+`mali` backend. IREE's experimental
+`iree_vulkan` plugin provides examples of PJRT compilation, device buffers,
+and execution.
+
+[IREE PJRT build guide](https://github.com/iree-org/iree/tree/v3.11.0/integrations/pjrt) · [JAX platform matrix](https://docs.jax.dev/en/latest/installation.html)
