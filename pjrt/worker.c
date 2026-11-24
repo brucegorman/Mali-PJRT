@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <vulkan/vulkan.h>
 
+#include "fence_probe.h"
 #include "protocol.h"
 #include "worker_buffers.h"
 
@@ -169,10 +170,20 @@ static int serve_client(int listener, const struct mali_vulkan *vulkan) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 3 && strcmp(argv[1], "--fence-probe") == 0) {
+        struct mali_vulkan vulkan = {0};
+        int result = 1;
+        if (open_vulkan(&vulkan)) {
+            printf("Fence probe device: %s\n", vulkan.info.name);
+            result = run_fence_probe(vulkan.runtime, vulkan.device, argv[2]);
+        }
+        close_vulkan(&vulkan);
+        return result;
+    }
     struct sockaddr_un address;
     socklen_t address_length;
     if (argc != 2 || !worker_address(argv[1], &address, &address_length)) {
-        fprintf(stderr, "Usage: %s ABSTRACT_SOCKET_NAME\n", argv[0]);
+        fprintf(stderr, "Usage: %s ABSTRACT_SOCKET_NAME | --fence-probe VMFB\n", argv[0]);
         return 2;
     }
 

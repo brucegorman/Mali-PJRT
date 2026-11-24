@@ -4,6 +4,13 @@
 真机是 vivo Y36m（Mali-G57 MC2，Android 13，GPU 驱动 Vulkan 1.1.177）。
 完成一个 part 时，把本轮复现的问题和验证结果随代码一起提交。
 
+## IREE v3.11.0 的 Vulkan 调用会等待设备侧 fence
+
+- **触发**：在 vivo Y36m 上用 `--iree-execution-model=async-external` 编译两段 StableHLO，传入尚未触发的起始 fence。
+- **实测**：保持起始 fence 不触发时，探针超过 30 秒未完成。改用 1 秒看门狗后，第一段调用直到看门狗触发才返回。一次 Release 测量为第一段提交 `1010.454 ms`、第二段 `2.398 ms`、最终等待 `0.003 ms`，最后读回 `[5, 7, 9, 11]`。第一段耗时包含人为设置的等待。
+- **原因**：该版本 `queue_alloca` 在主机端等输入 semaphore，而 `queue_execute` 在释放转换后的命令缓冲区之前等完成 semaphore。编译器生成 `coarse-fences` 入口后，Vulkan HAL 仍包含这些等待。[IREE v3.11.0 Vulkan 实现](https://github.com/iree-org/iree/blob/v3.11.0/runtime/src/iree/hal/drivers/vulkan/vulkan_device.cc#L1661)
+- **复现**：`run_on_phone.sh --fences` 独立编译并运行探针。退出码 `3` 表示数值正确且提交被看门狗释放。接入 PJRT event 前需先让目标 Vulkan runtime 的 fence 探针返回 `0`。
+
 ## 同步执行会卡住 JIT 提交
 
 - **触发**：编译并上传后用 `SIGSTOP` 暂停测试 worker，再提交两次有依赖的执行。

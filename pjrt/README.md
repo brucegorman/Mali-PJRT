@@ -95,6 +95,22 @@ second event. The `--disconnect` JAX check queues two dependent calls while
 its worker is paused, then kills the worker and checks that both waits and a
 readback report `UNAVAILABLE` with operation context.
 
+### Probe Vulkan fence submission
+
+On Mali-G57, run `adb shell -T sh "$deviceDir/pjrt/run_on_phone.sh" --fences`.
+The probe compiles two StableHLO exports on the phone with
+`--iree-execution-model=async-external`. The Android worker calls each export
+with an IREE wait/signal fence, passes the intermediate device buffer directly
+to the second export, waits on the final fence, and checks `[5, 7, 9, 11]`.
+
+The start fence is initially unsignaled. The probe releases it when both
+calls have returned and both completion fences are still pending. A one-second
+watchdog releases it if submission blocks. Exit `0` confirms pending returns,
+`3` means the watchdog released the gate and the numerical result was correct,
+and other nonzero exits indicate a probe failure. The pinned Vulkan runtime
+on the Y36m returns `3`. `submit_first_ms` includes any watchdog delay, and
+`final_wait_ms` measures only the explicit wait after opening the gate.
+
 ## Reuse a compiled executable after restart
 
 Compile once in Python on the phone and save the executable bytes:

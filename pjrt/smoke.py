@@ -234,6 +234,35 @@ def check_disconnect(worker_pid, worker_stdout):
     print("PASS: worker exit fails both queued results and subsequent readback", flush=True)
 
 
+def check_fences(package):
+    source = """module {
+  func.func public @double(%x: tensor<4xi32>) -> tensor<4xi32> {
+    %y = stablehlo.add %x, %x : tensor<4xi32>
+    return %y : tensor<4xi32>
+  }
+  func.func public @add_three(%y: tensor<4xi32>) -> tensor<4xi32> {
+    %three = stablehlo.constant dense<3> : tensor<4xi32>
+    %z = stablehlo.add %y, %three : tensor<4xi32>
+    return %z : tensor<4xi32>
+  }
+}"""
+    with tempfile.TemporaryDirectory(prefix="pjrt-fences-") as temporary:
+        mlir = Path(temporary) / "chain.mlir"
+        vmfb = Path(temporary) / "chain.vmfb"
+        mlir.write_text(source, encoding="utf-8")
+        start = time.monotonic()
+        subprocess.run([
+            os.environ["MALI_GLIBC_LOADER"], "--library-path", os.environ["MALI_GLIBC_LIBRARIES"],
+            os.environ["MALI_IREE_COMPILER"], str(mlir), "--iree-input-type=stablehlo",
+            "--iree-hal-target-device=vulkan", "--iree-vulkan-target=mali-g57",
+            "--iree-execution-model=async-external", "-o", str(vmfb),
+        ], check=True, timeout=60)
+        print(f"Compiled two coarse-fences exports on the phone in {time.monotonic() - start:.3f}s",
+              flush=True)
+        return subprocess.run([str(package / "mali_worker"), "--fence-probe", str(vmfb)],
+                              timeout=30).returncode
+
+
 def run_worker(package, command, disconnect=False, async_probe=False):
     socket_name = f"mali-pjrt-{uuid.uuid4().hex}"
     environment = {**os.environ, "MALI_PJRT_SOCKET": socket_name}
@@ -269,6 +298,7 @@ def main():
     mode.add_argument("--abi", action="store_true", help="Check compile options and output metadata via C")
     mode.add_argument("--async", dest="async_probe", action="store_true",
                       help="Check pending events and queued execution with a paused worker")
+    mode.add_argument("--fences", action="store_true", help="Check IREE Vulkan fence chaining")
     mode.add_argument("--cache", action="store_true", help="Save and reload a JIT in separate processes")
     mode.add_argument("--disconnect", action="store_true", help="Check errors after the worker exits")
     mode.add_argument("--disconnect-client", nargs=2, type=int, help=argparse.SUPPRESS)
@@ -292,7 +322,9 @@ def main():
 
     package = Path(__file__).resolve().parent
     client_command = ["/system/bin/sh", str(package / "run_on_phone.sh")]
-    if args.disconnect:
+    if args.fences:
+        raise SystemExit(check_fences(package))
+    elif args.disconnect:
         run_worker(package, client_command, disconnect=True)
     elif args.cache:
         with tempfile.TemporaryDirectory(prefix="pjrt-cache-") as temporary:

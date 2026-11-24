@@ -1,6 +1,7 @@
 add_executable(mali_worker
   "${CMAKE_CURRENT_LIST_DIR}/worker.c"
   "${CMAKE_CURRENT_LIST_DIR}/worker_buffers.c"
+  "${CMAKE_CURRENT_LIST_DIR}/fence_probe.c"
   "${CMAKE_CURRENT_LIST_DIR}/output_metadata.c"
 )
 target_compile_features(mali_worker PRIVATE c_std_11)
