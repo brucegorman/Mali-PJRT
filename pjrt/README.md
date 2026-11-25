@@ -1,6 +1,6 @@
 # Mali PJRT backend
 
-[错误与复现记录](BUGS.md)
+[中文源码阅读指南](READING_GUIDE.md) · [错误与复现记录](BUGS.md)
 
 JAX 0.6.1 loads a Linux arm64 PJRT library and connects to an Android arm64
 worker over an abstract Unix socket. The worker opens a Vulkan logical device
