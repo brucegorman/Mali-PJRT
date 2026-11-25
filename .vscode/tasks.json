@@ -1,0 +1,39 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Mali phone: start PJRT plugin debugger",
+            "type": "process",
+            "command": "${workspaceFolder}/.venv/Scripts/python.exe",
+            "args": ["-u", "${workspaceFolder}/.vscode/phone_debug.py", "plugin"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "isBackground": true,
+            "problemMatcher": {
+                "owner": "mali-phone-debug",
+                "pattern": { "regexp": "^(.+):(\\d+): (error): (.+)$", "file": 1, "line": 2, "severity": 3, "message": 4 },
+                "background": { "activeOnStart": true, "beginsPattern": "^MALI_DEBUG_START$", "endsPattern": "^MALI_DEBUG_READY$" }
+            }
+        },
+        {
+            "label": "Mali phone: start worker debugger",
+            "type": "process",
+            "command": "${workspaceFolder}/.venv/Scripts/python.exe",
+            "args": ["-u", "${workspaceFolder}/.vscode/phone_debug.py", "worker"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "isBackground": true,
+            "problemMatcher": {
+                "owner": "mali-phone-debug",
+                "pattern": { "regexp": "^(.+):(\\d+): (error): (.+)$", "file": 1, "line": 2, "severity": 3, "message": 4 },
+                "background": { "activeOnStart": true, "beginsPattern": "^MALI_DEBUG_START$", "endsPattern": "^MALI_DEBUG_READY$" }
+            }
+        },
+        {
+            "label": "Mali phone: run client against debug worker",
+            "type": "process",
+            "command": "${workspaceFolder}/.venv/Scripts/python.exe",
+            "args": ["-u", "${workspaceFolder}/.vscode/phone_debug.py", "client"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": []
+        }
+    ]
+}

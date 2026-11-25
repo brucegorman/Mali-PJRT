@@ -153,6 +153,20 @@ The `--cache` smoke test writes an image, exits, and starts a fresh worker and
 Python process. The second process unsets the compiler path, rejects altered
 images, and runs the saved training twice without compiling.
 
+## VS Code 调试
+
+在 VS Code 打开 `jax-mali` 根目录。工作区配置使用 `.venv/Scripts/python.exe`，并为 C IntelliSense 提供 Android NDK、PJRT 和 IREE 的头文件路径。如果 VS Code 已为此工作区记住其他解释器，运行 `Python: Select Interpreter` 选择项目的 `.venv`。
+
+在 **Run and Debug** 里按需选择一个配置。
+
+| 配置 | 怎么用 |
+|---|---|
+| `Python: CPU training smoke` | 在电脑上用 `.venv` 运行根目录的 `smoke.py`。可在 `train_step()` 打 Python 断点。 |
+| `Mali phone: PJRT plugin in Python` | 启动手机上的 worker，并用 CodeLLDB 调试手机 Python 加载的 C 插件。可在 `client_create()` 或 `loaded_execute()` 打断点。从入口暂停处按 F5 继续。 |
+| `Mali phone: Android worker` | 用 CodeLLDB 附加到已打开 Vulkan 的 worker。可在 `serve_client()` 后面的请求处理代码或 `execute_module()` 打断点。按 F5 继续，再用 **Tasks: Run Task** 运行 `Mali phone: run client against debug worker`。需要调试更早的 `open_vulkan()` 时，用下节的手动启动方式。 |
+
+手机配置自动构建并推送带符号的 `build/pjrt-vscode`、启动 Android `lldb-server`，并通过 ADB 转发本机端口 `49185`。一次运行一个手机调试会话。两种手机配置都使用已准备好的手机 Python 和编译器环境。如果手机工作目录不同，在启动 VS Code 的环境中设置 `JAX_MALI_PHONE_DIR`。手动命令见下节。
+
 ## Android 调试入门
 
 ADB 负责连手机、传文件和转发端口。Windows 上的 LLDB 读取本地带符号的二进制，手机上的 arm64 `lldb-server` 负责暂停进程和读取内存。两端的二进制要来自同一次构建。

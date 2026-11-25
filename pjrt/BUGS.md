@@ -4,6 +4,13 @@
 真机是 vivo Y36m（Mali-G57 MC2，Android 13，GPU 驱动 Vulkan 1.1.177）。
 完成一个 part 时，把本轮复现的问题和验证结果随代码一起提交。
 
+## LLDB 连上手机 Python 后，PJRT 插件断点仍未解析
+
+- **触发**：通过 glibc loader 启动手机上的 Python，经 Android `lldb-server` 附加，在 `loaded_execute()` 设断点。
+- **实测**：JAX 能在 Mali 上实际执行，LLDB 模块列表却没有 `libpjrt_mali.so`，源代码断点不触发。
+- **修复**：VS Code 调试任务在初始化 PJRT 前预加载插件并记录手机上的映射基址。CodeLLDB 加载同一次构建的本地符号，并应用该地址。
+- **回归**：使用 `Mali phone: PJRT plugin in Python` 启动调试，在 `executable.c` 的 `loaded_execute()` 函数体打源代码断点。
+
 ## IREE v3.11.0 的 Vulkan 调用会等待设备侧 fence
 
 - **触发**：在 vivo Y36m 上用 `--iree-execution-model=async-external` 编译两段 StableHLO，传入尚未触发的起始 fence。

@@ -1,0 +1,19 @@
+{
+    "version": 4,
+    "configurations": [
+        {
+            "name": "Android ARM64",
+            "compilerPath": "${workspaceFolder}/../.gpu-android-tools/android-ndk-r30/toolchains/llvm/prebuilt/windows-x86_64/bin/clang.exe",
+            "compilerArgs": ["--target=aarch64-linux-android29"],
+            "intelliSenseMode": "linux-clang-arm64",
+            "cStandard": "c11",
+            "compileCommands": "${workspaceFolder}/build/pjrt-iree-debug/compile_commands.json",
+            "includePath": [
+                "${workspaceFolder}/pjrt",
+                "${workspaceFolder}/build/pjrt-deps",
+                "${workspaceFolder}/build/iree-3.11-src/runtime/src",
+                "${workspaceFolder}/build/pjrt-iree-debug/runtime/src"
+            ]
+        }
+    ]
+}

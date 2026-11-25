@@ -1,0 +1,42 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: CPU training smoke",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+            "program": "${workspaceFolder}/smoke.py",
+            "args": ["--platform", "cpu"],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Mali phone: PJRT plugin in Python",
+            "type": "lldb",
+            "request": "launch",
+            "preLaunchTask": "Mali phone: start PJRT plugin debugger",
+            "targetCreateCommands": [
+                "target create \"${workspaceFolder}/build/pjrt-vscode-symbols/ld-linux-aarch64.so.1\"",
+                "target modules add \"${workspaceFolder}/build/pjrt-vscode/jax_plugins/mali/libpjrt_mali.so\""
+            ],
+            "processCreateCommands": ["gdb-remote 127.0.0.1:49185"],
+            "postRunCommands": [
+                "command source \"${workspaceFolder}/build/pjrt-vscode-symbols/plugin-symbols.lldb\"",
+                "process handle --stop false --notify false --pass false SIGSTOP"
+            ],
+            "stopOnEntry": true
+        },
+        {
+            "name": "Mali phone: Android worker",
+            "type": "lldb",
+            "request": "launch",
+            "preLaunchTask": "Mali phone: start worker debugger",
+            "targetCreateCommands": [
+                "target create \"${workspaceFolder}/build/pjrt-vscode/mali_worker\""
+            ],
+            "processCreateCommands": ["gdb-remote 127.0.0.1:49185"],
+            "stopOnEntry": true
+        }
+    ]
+}
