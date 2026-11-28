@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/socket.h>
@@ -145,10 +147,33 @@ static void close_vulkan(struct mali_vulkan *vulkan) {
     }
 }
 
+static int accept_client(int listener) {
+    const uid_t worker_uid = geteuid();
+    for (;;) {
+        int client = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+        if (client < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("accept4");
+            return -1;
+        }
+
+        struct ucred peer;
+        socklen_t peer_size = sizeof(peer);
+        if (getsockopt(client, SOL_SOCKET, SO_PEERCRED, &peer, &peer_size) == 0 &&
+            peer_size == sizeof(peer) && peer.uid == worker_uid) {
+            return client;
+        }
+
+        fputs("Rejected Mali worker connection without matching peer UID\n", stderr);
+        close(client);
+    }
+}
+
 static int serve_client(int listener, const struct mali_vulkan *vulkan) {
-    int client = accept(listener, NULL, NULL);
+    int client = accept_client(listener);
     if (client < 0) {
-        perror("accept");
         return 1;
     }
 

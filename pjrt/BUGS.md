@@ -4,6 +4,12 @@
 真机是 vivo Y36m（Mali-G57 MC2，Android 13，GPU 驱动 Vulkan 1.1.177）。
 完成一个 part 时，把本轮复现的问题和验证结果随代码一起提交。
 
+## Worker 在握手前未校验连接者身份
+
+- Worker 的 abstract Unix socket 接入后直接读取固定握手。能到达 socket 的进程可占用唯一会话，通过握手后也能提交 `MALI_LOAD` 路径。
+- Worker 现在在读取握手前用 `SO_PEERCRED` 校验对端的有效 UID。查询失败、凭据大小异常或 UID 不匹配时，关闭该连接并接着监听。
+- 在 Y36m 上对接入逻辑注入上述三种失败，验证每条连接都被拒绝，随后同 UID 的连接仍可接入。默认 JAX 训练和 `--abi`、`--async`、`--cache`、`--disconnect` 均通过。[接入代码](worker.c) · [Production 清单](README.md#production-checklist)
+
 ## Sustained Mali training needed a worker timeout override
 
 - The DNN fixture starts 96 training steps through `run_worker()` in `smoke.py`.

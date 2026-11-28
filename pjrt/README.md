@@ -51,6 +51,17 @@ waits for the producing event before taking the socket lock. The Android
 worker runs one IREE invocation at a time. Host send/receive callbacks and
 distributed execution are outside this implementation.
 
+## Production checklist
+
+- [x] Authenticate the client before reading the protocol handshake. The worker
+  checks `SO_PEERCRED` against its effective UID and keeps listening after a
+  rejection. Run the client and worker under the same dedicated UID.
+- [ ] If other processes share that UID and require isolation, pass a private
+  connection from a trusted launcher to the intended client and worker.
+- [ ] Restrict VMFB inputs to the authorized producer before accepting requests
+  from less trusted clients. `MALI_LOAD` currently opens the supplied path with
+  the worker's filesystem permissions.
+
 ## Build and check
 
 With Python, CMake, Ninja, and Zig available, prepare the IREE v3.11 source
