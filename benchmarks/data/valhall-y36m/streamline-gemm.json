@@ -1,0 +1,64 @@
+{
+  "device": "vivo Y36m (Mali-G57 MC2, Android 13)",
+  "tools": {
+    "gatord": "9.9.1",
+    "mali_offline_compiler": "2026.5.0"
+  },
+  "gemm": {
+    "m": 4096,
+    "n": 1024,
+    "k": 1024,
+    "input_type": "FP16",
+    "output_type": "FP32",
+    "calls": 512,
+    "block_seconds": [
+      7.244,
+      7.255,
+      7.269,
+      7.246,
+      7.234,
+      7.266,
+      7.257,
+      7.325
+    ],
+    "total_seconds": 58.096,
+    "gflops": 75.7
+  },
+  "streamline": {
+    "steady_one_second_bins": 57,
+    "minimum_gpu_active_cycles_per_bin": 800000000,
+    "minimum_fma_pipe_instructions_per_bin": 1000000000,
+    "gpu_active_cycles": 51692564429,
+    "shader_core_active_cycles": 103367561372,
+    "fma_pipe_instructions": 67447414459,
+    "all_register_warps": 8228296,
+    "fragment_warps": 0,
+    "non_fragment_warps": 8228799,
+    "l2_read_lookups": 0,
+    "l2_write_lookups": 0,
+    "external_read_beats": 0,
+    "external_write_beats": 0,
+    "shader_load_store_external_read_beats": 34527717128,
+    "shader_load_store_l2_read_beats": 78507234692,
+    "fma_pipe_utilization_percent": 65.25,
+    "all_register_warp_percent": 99.994,
+    "l2_and_external_bus_counters_usable": false
+  },
+  "offline_shader_analysis": {
+    "work_registers_used": 63,
+    "thread_occupancy": 50,
+    "stack_spill_bytes": 0,
+    "fp16_arithmetic": 0,
+    "limiting_pipelines": [
+      "load_store"
+    ],
+    "longest_path_cycles": {
+      "arith_total": 512.5,
+      "arith_fma": 512.5,
+      "arith_cvt": 40.75,
+      "arith_sfu": 33.0,
+      "load_store": 1280.0,
+      "texture": 0.0
+    }
+  }
+}

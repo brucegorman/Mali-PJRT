@@ -104,4 +104,7 @@ executes the result with its Vulkan device. The verification chains two
 calls before reading back the weights. IREE's experimental `iree_vulkan`
 plugin provides additional examples of PJRT integration.
 
+See the [benchmark directory](benchmarks/README.md) for real-model results,
+performance figures, and power capture and energy-efficiency plotting.
+
 [IREE PJRT build guide](https://github.com/iree-org/iree/tree/v3.11.0/integrations/pjrt) · [JAX platform matrix](https://docs.jax.dev/en/latest/installation.html)

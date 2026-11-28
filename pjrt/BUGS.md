@@ -4,12 +4,29 @@
 真机是 vivo Y36m（Mali-G57 MC2，Android 13，GPU 驱动 Vulkan 1.1.177）。
 完成一个 part 时，把本轮复现的问题和验证结果随代码一起提交。
 
-## SPIR-V 编译接受了 tuning spec 参数，但仍使用默认 tile
+## Sustained Mali training needed a worker timeout override
 
-- **触发**：IREE v3.11.0 为 `mali-g57` 编译混合精度矩阵乘，传 `--iree-codegen-tuning-spec-path` 并导出 executable configuration。
-- **实测**：编译成功，`balanced` 候选预期的 `8 × 4` workgroup 仍是默认的 `8 × 2`。
-- **处理**：改为 `--iree-codegen-transform-dialect-library`。配置转储确认前向、输入梯度和权重梯度命中，`shared` 也进入 `SPIRVMatmulPromoteVectorize`。
-- **回归**：对比生成的 SPIR-V executable configuration。手机端用 `MALI_IREE_TUNING_SPEC` 接入同一参数。[配置复现](../benchmarks/README.md#valhall-矩阵乘和激活存储)
+- The DNN fixture starts 96 training steps through `run_worker()` in `smoke.py`.
+- After 11 probes and the CPU run passed, the first Mali launch failed because the worker helper did not accept the `timeout` keyword. It failed before submitting GPU work.
+- The helper accepts a timeout override and defaults to 90 seconds. The disconnect test keeps its 30-second limit. The benchmark runner records each process's exit status.
+- The rerun reused the completed probes and CPU control and finished all three Mali training runs. [Benchmark runner](../benchmarks/run_y36m.py)
+
+## The restored ranker fixture lacked a `median` import
+
+- The first on-device CPU process finished training and raised `NameError` while printing the median.
+- Restoring `statistics.median` allowed all eight small-model and batch-sweep processes to finish. [Benchmark fixture](../benchmarks/valhall_ranker.py)
+
+## The SPIR-V compiler accepted the tuning flag and kept the default tiles
+
+- IREE v3.11.0 accepted `--iree-codegen-tuning-spec-path` while compiling mixed-precision GEMMs for `mali-g57`.
+- The executable configuration showed the default `8 × 2` workgroup for the `balanced` candidate, which requested `8 × 4`.
+- Switching to `--iree-codegen-transform-dialect-library` matched the forward and both gradient contractions. It also selected `SPIRVMatmulPromoteVectorize` for `shared`.
+- Inspect the generated executable configurations to verify the selected tiles. On the phone, `MALI_IREE_TUNING_SPEC` passes the same compiler flag. [Valhall benchmark](../benchmarks/README.md#valhall-gemm-and-activation-storage)
+
+## Y36m battery traces include external-power status
+
+- A Perfetto capability probe collected 29 battery samples during USB power and exposed no hardware rails. Perfetto v25 also rejected `BATTERY_COUNTER_VOLTAGE`, and streaming the binary trace through the ADB shell changed line endings.
+- The collector writes a device trace file, transfers it with `adb pull`, and separately samples battery voltage and power status. Battery energy comparisons require a discharge window. External meters and available hardware rails can be compared in separate campaigns. [Benchmark instructions](../benchmarks/README.md)
 
 ## LLDB 连上手机 Python 后，PJRT 插件断点仍未解析
 

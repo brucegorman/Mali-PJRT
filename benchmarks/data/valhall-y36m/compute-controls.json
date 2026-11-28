@@ -1,0 +1,96 @@
+{
+  "pjrt": "4e7b58c24ca39e5458901837a5d4a88a6d537700",
+  "pjrt_build_source": "9b6cf246141db608bf11c52e136170864a87879e",
+  "fixture_sha256": "2bce7529b42b0f261abce62c9a22330cd33739cdbc06e794364de16256f06677",
+  "fixture_origin": "4d42700a99165d43917d27555ffc613c302bff36",
+  "fp32_training": [
+    {
+      "platform": "cpu",
+      "profile": "baseline",
+      "compile_and_load_s": 1.123,
+      "block_seconds": [
+        6.16,
+        5.95,
+        5.489,
+        5.244,
+        5.067,
+        5.033,
+        5.138,
+        4.684,
+        4.662,
+        4.786,
+        4.96,
+        5.387
+      ],
+      "total_train_s": 62.56,
+      "pairs_per_s": 6285,
+      "first_window_pairs_per_s": 5738,
+      "last_window_pairs_per_s": 6621,
+      "eval_loss_before": 0.9799,
+      "eval_loss_after": 0.3545,
+      "accuracy": 0.854,
+      "ndcg_at_5": 0.9831
+    },
+    {
+      "platform": "mali",
+      "profile": "reuse-gradients",
+      "compile_and_load_s": 5.329,
+      "block_seconds": [
+        8.892,
+        8.823,
+        8.801,
+        8.756,
+        8.836,
+        8.776,
+        8.856,
+        8.812,
+        8.839,
+        8.798,
+        8.858,
+        8.79
+      ],
+      "total_train_s": 105.837,
+      "pairs_per_s": 3715,
+      "first_window_pairs_per_s": 3716,
+      "last_window_pairs_per_s": 3715,
+      "eval_loss_before": 0.9799,
+      "eval_loss_after": 0.3545,
+      "accuracy": 0.854,
+      "ndcg_at_5": 0.9831
+    }
+  ],
+  "gemm": [
+    {
+      "platform": "cpu",
+      "profile": "baseline",
+      "block_seconds": [
+        9.507,
+        9.575,
+        9.616,
+        9.686,
+        9.735,
+        9.869,
+        9.634,
+        9.518
+      ],
+      "total_gemm_s": 77.139,
+      "effective_gflops": 57.01
+    },
+    {
+      "platform": "mali",
+      "profile": "reuse-gradients",
+      "block_seconds": [
+        8.15,
+        8.816,
+        8.749,
+        8.155,
+        9.234,
+        8.915,
+        8.209,
+        8.616
+      ],
+      "total_gemm_s": 68.844,
+      "effective_gflops": 63.88
+    }
+  ]
+}

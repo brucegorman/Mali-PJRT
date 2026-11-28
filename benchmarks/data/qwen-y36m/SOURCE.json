@@ -1,0 +1,23 @@
+{
+  "repository": "https://github.com/brucegorman/mali",
+  "revision": "e7e865f4562e362e7409764ff8d144bd8c0a9942",
+  "device": "vivo Y36m (Mali-G57 MC2)",
+  "model": "Qwen2.5-0.5B-Instruct Q4_0",
+  "runner": "benchmarks/run_y36m.py --suite qwen",
+  "files": [
+    "activation-layout/1-weights/compare.json",
+    "activation-layout/2-both/compare.json",
+    "activation-layout/3-both/compare.json",
+    "activation-layout/4-weights/compare.json",
+    "kernel.csv",
+    "shape-profile/aligned/compare.json",
+    "shape-profile/long-aligned/compare.json",
+    "verified/compare.json",
+    "verified/fallback.json",
+    "verified/holdout/compare.json",
+    "weight-layout/1-raw/compare.json",
+    "weight-layout/2-soa/compare.json",
+    "weight-layout/3-soa/compare.json",
+    "weight-layout/4-raw/compare.json"
+  ]
+}
