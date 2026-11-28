@@ -60,6 +60,20 @@ static PJRT_Error *compile_module(const PJRT_Program *program, const char *targe
         return make_error(PJRT_Error_Code_FAILED_PRECONDITION,
                           "Set the phone IREE compiler environment before calling JAX");
     }
+    const char *spec = getenv("MALI_IREE_TUNING_SPEC");
+    char tuning_flag[4096];
+    char *tuning = NULL;
+    if (spec != NULL && *spec != '\0') {
+        if (target == NULL) {
+            return make_error(PJRT_Error_Code_FAILED_PRECONDITION,
+                              "MALI_IREE_TUNING_SPEC requires a Mali-G57 device");
+        }
+        int size = snprintf(tuning_flag, sizeof(tuning_flag), "--iree-codegen-transform-dialect-library=%s", spec);
+        if (size < 0 || (size_t)size >= sizeof(tuning_flag)) {
+            return make_error(PJRT_Error_Code_INVALID_ARGUMENT, "Mali tuning spec path is too long");
+        }
+        tuning = tuning_flag;
+    }
     char input[4096];
     int length = snprintf(input, sizeof(input), "%s/pjrt-mlir-XXXXXX", temporary);
     if (length < 0 || (size_t)length >= sizeof(input) ||
@@ -80,7 +94,7 @@ static PJRT_Error *compile_module(const PJRT_Program *program, const char *targe
         char *argv[] = {
             (char *)loader, "--library-path", (char *)libraries, (char *)compiler, input,
             "--iree-input-type=stablehlo", "--iree-hal-target-device=vulkan", "-o", output,
-            (char *)target, NULL,
+            (char *)target, tuning, NULL,
         };
         pid_t pid;
         if (posix_spawn(&pid, loader, NULL, NULL, argv, environ) != 0) {

@@ -2,6 +2,8 @@
 
 [中文源码阅读指南](READING_GUIDE.md) · [错误与复现记录](BUGS.md)
 
+[Valhall 矩阵乘与激活存储](../benchmarks/README.md#valhall-矩阵乘和激活存储)
+
 JAX 0.6.1 loads a Linux arm64 PJRT library and connects to an Android arm64
 worker over an abstract Unix socket. The worker opens a Vulkan logical device
 and compute queue. JAX exposes that device through `jax.devices("mali")`.

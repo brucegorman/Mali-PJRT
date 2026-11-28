@@ -263,7 +263,77 @@ def check_fences(package):
                               timeout=30).returncode
 
 
-def run_worker(package, command, disconnect=False, async_probe=False):
+def check_valhall():
+    from statistics import median
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    device, = jax.devices("mali")
+    rng = np.random.default_rng(42)
+    inputs = rng.standard_normal((4096, 1024), dtype=np.float32).astype(np.float16)
+    weights = tuple((rng.standard_normal((1024, 1024), dtype=np.float32) / 32).astype(np.float16)
+                    for _ in range(2))
+    features, first_weights, second_weights = jax.device_put((inputs, *weights), device)
+    ref_first = np.maximum(inputs[:8].astype(np.float32) @ weights[0].astype(np.float32), 0)
+    expected = ref_first.astype(np.float16).astype(np.float32) @ weights[1].astype(np.float32)
+
+    def matmul(features, weights):
+        return jnp.matmul(features.astype(jnp.float16), weights, preferred_element_type=jnp.float32)
+
+    def median_ms(call):
+        durations = []
+        for _ in range(7):
+            start = time.perf_counter()
+            result = jax.block_until_ready(call())
+            durations.append((time.perf_counter() - start) * 1000)
+            del result
+        return median(durations)
+
+    consume = jax.jit(matmul)
+    config = os.environ.get("MALI_IREE_TUNING_SPEC") or "baseline"
+    print(f"device={device.device_kind}, tuning={config}", flush=True)
+    for storage in (jnp.float32, jnp.float16):
+        def produce(features, weights):
+            return jax.nn.relu(matmul(features, weights)).astype(storage)
+
+        producer = jax.jit(produce).lower(features, first_weights).compile()
+        activation = producer(features, first_weights).block_until_ready()
+        consumer = consume.lower(activation, second_weights).compile()
+        result = consumer(activation, second_weights).block_until_ready()
+        if activation.device != device or result.device != device:
+            raise RuntimeError("Valhall probe requires both outputs on Mali")
+        expected_bytes = 4096 * 1024 * np.dtype(storage).itemsize
+        if activation.on_device_size_in_bytes() != expected_bytes or result.dtype != jnp.float32:
+            raise RuntimeError("Unexpected Valhall activation size or result precision")
+        np.testing.assert_allclose(np.asarray(result)[:8], expected, rtol=0.01, atol=0.004)
+
+        elapsed = median_ms(lambda: consumer(producer(features, first_weights), second_weights))
+        print(f"storage={np.dtype(storage).name}, activation_bytes={expected_bytes}, "
+              f"two_layers_ms={elapsed:.3f}", flush=True)
+
+    # `activation` is the FP16 output of the last case. Use the original
+    # input as a reproducible single-layer cotangent at the same shape.
+    def backward(activation, cotangent, weights):
+        return matmul(cotangent, weights.T), matmul(activation.T, cotangent)
+
+    compiled = jax.jit(backward).lower(activation, features, second_weights).compile()
+    dx, dw = jax.block_until_ready(compiled(activation, features, second_weights))
+    if any(array.device != device or array.dtype != jnp.float32 for array in (dx, dw)):
+        raise RuntimeError("Valhall gradient probe requires FP32 outputs on Mali")
+    host_activations = np.asarray(activation)[:, :8].astype(np.float32)
+    np.testing.assert_allclose(np.asarray(dx)[:8, :8],
+                               inputs[:8].astype(np.float32) @ weights[1][:8].astype(np.float32).T,
+                               rtol=0.01, atol=0.01)
+    np.testing.assert_allclose(np.asarray(dw)[:8, :8],
+                               host_activations.T @ inputs[:, :8].astype(np.float32),
+                               rtol=0.01, atol=0.01)
+    print(f"backward_two_matmuls_ms={median_ms(lambda: compiled(activation, features, second_weights)):.3f}",
+          flush=True)
+
+
+def run_worker(package, command, disconnect=False, async_probe=False, timeout=90):
     socket_name = f"mali-pjrt-{uuid.uuid4().hex}"
     environment = {**os.environ, "MALI_PJRT_SOCKET": socket_name}
     worker = subprocess.Popen([str(package / "mali_worker"), socket_name],
@@ -279,7 +349,7 @@ def run_worker(package, command, disconnect=False, async_probe=False):
             command = [*command, "--disconnect-client", str(worker.pid), str(pass_fds[0])]
         if async_probe:
             command = [*command, str(worker.pid)]
-        subprocess.run(command, check=True, timeout=30 if disconnect else 90,
+        subprocess.run(command, check=True, timeout=30 if disconnect else timeout,
                        env=environment, pass_fds=pass_fds)
         expected_exit = -signal.SIGKILL if disconnect else 0
         if worker.wait(timeout=5) != expected_exit:
@@ -299,6 +369,8 @@ def main():
     mode.add_argument("--async", dest="async_probe", action="store_true",
                       help="Check pending events and queued execution with a paused worker")
     mode.add_argument("--fences", action="store_true", help="Check IREE Vulkan fence chaining")
+    mode.add_argument("--valhall", action="store_true", help="Compare activation storage on Mali")
+    mode.add_argument("--valhall-client", action="store_true", help=argparse.SUPPRESS)
     mode.add_argument("--cache", action="store_true", help="Save and reload a JIT in separate processes")
     mode.add_argument("--disconnect", action="store_true", help="Check errors after the worker exits")
     mode.add_argument("--disconnect-client", nargs=2, type=int, help=argparse.SUPPRESS)
@@ -306,6 +378,9 @@ def main():
     mode.add_argument("--cache-write", type=Path, help=argparse.SUPPRESS)
     mode.add_argument("--cache-read", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.valhall_client:
+        check_valhall()
+        return
     if args.disconnect_client:
         check_disconnect(*args.disconnect_client)
         return
@@ -324,6 +399,8 @@ def main():
     client_command = ["/system/bin/sh", str(package / "run_on_phone.sh")]
     if args.fences:
         raise SystemExit(check_fences(package))
+    elif args.valhall:
+        run_worker(package, [*client_command, "--valhall-client"])
     elif args.disconnect:
         run_worker(package, client_command, disconnect=True)
     elif args.cache:

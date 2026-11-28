@@ -4,6 +4,13 @@
 真机是 vivo Y36m（Mali-G57 MC2，Android 13，GPU 驱动 Vulkan 1.1.177）。
 完成一个 part 时，把本轮复现的问题和验证结果随代码一起提交。
 
+## SPIR-V 编译接受了 tuning spec 参数，但仍使用默认 tile
+
+- **触发**：IREE v3.11.0 为 `mali-g57` 编译混合精度矩阵乘，传 `--iree-codegen-tuning-spec-path` 并导出 executable configuration。
+- **实测**：编译成功，`balanced` 候选预期的 `8 × 4` workgroup 仍是默认的 `8 × 2`。
+- **处理**：改为 `--iree-codegen-transform-dialect-library`。配置转储确认前向、输入梯度和权重梯度命中，`shared` 也进入 `SPIRVMatmulPromoteVectorize`。
+- **回归**：对比生成的 SPIR-V executable configuration。手机端用 `MALI_IREE_TUNING_SPEC` 接入同一参数。[配置复现](../benchmarks/README.md#valhall-矩阵乘和激活存储)
+
 ## LLDB 连上手机 Python 后，PJRT 插件断点仍未解析
 
 - **触发**：通过 glibc loader 启动手机上的 Python，经 Android `lldb-server` 附加，在 `loaded_execute()` 设断点。
